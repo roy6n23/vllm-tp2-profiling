@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Fake Nsight Systems CLI for dry runs and tests (stdlib only).
+
+  nsys --version
+  nsys status --environment
+  nsys profile [--k=v ...] <target...>      runs the target with FAKE_NSYS_EVENTS=<output>.events.jsonl
+  nsys export --type=sqlite --force-overwrite=true --output=X.sqlite X.nsys-rep
+
+The export turns the C4 events written by the fake engine into a synthetic SQLite trace
+(tests/synth_trace.py). FAKE_NSYS_DROP_RANK_TAIL=1 drops rank 1's last 3 steps when the
+capture range was cudaProfilerApi (the multi-process flush defect); FAKE_NSYS_HANG=1 makes
+`profile` sleep past any timeout.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from tpprof.constants import NSYS_VERSION  # noqa: E402  (after the sys.path insert)
+
+VERSION = f"NVIDIA Nsight Systems version {NSYS_VERSION}.161-265138896106v0"
+
+
+def _options(args: list[str]) -> tuple[dict[str, str], list[str]]:
+    """--k=v options up to the first token that does not start with --, then the rest."""
+    opts: dict[str, str] = {}
+    i = 0
+    while i < len(args) and args[i].startswith("--"):
+        key, _, value = args[i][2:].partition("=")
+        opts[key] = value
+        i += 1
+    return opts, args[i:]
+
+
+def _base(output: str, ext: str) -> str:
+    return output[: -len(ext)] if output.endswith(ext) else output
+
+
+def profile(args: list[str]) -> int:
+    opts, target = _options(args)
+    if not target:
+        print("nsys profile: no application specified", file=sys.stderr)
+        return 1
+    output = _base(opts.get("output", "report1"), ".nsys-rep")
+    events = f"{output}.events.jsonl"
+    if os.environ.get("FAKE_NSYS_HANG") == "1":
+        time.sleep(3600)
+    if os.path.exists(events):
+        os.remove(events)
+    print("Collecting data...", flush=True)
+    env = dict(os.environ, FAKE_NSYS_EVENTS=events)
+    try:
+        code = subprocess.call(target, env=env)
+    except OSError as e:
+        print(f"nsys profile: cannot run {target[0]}: {e}", file=sys.stderr)
+        code = 1
+    if code < 0:
+        code = 128 - code
+    rep = f"{output}.nsys-rep"
+    with open(rep, "w") as f:
+        json.dump({"events": events, "capture_range": opts.get("capture-range", "none"),
+                   "argv": [sys.argv[0], "profile", *args]}, f)
+    print(f"Generating '{output}.qdstrm'\nGenerated:\n    {rep}", flush=True)
+    return code
+
+
+def export(args: list[str]) -> int:
+    opts, rest = _options(args)
+    if opts.get("type", "sqlite") != "sqlite":
+        print(f"nsys export: unsupported type {opts['type']!r} in this fake", file=sys.stderr)
+        return 1
+    if len(rest) != 1:
+        print("nsys export: expected one .nsys-rep file", file=sys.stderr)
+        return 1
+    rep = rest[0]
+    out = opts.get("output") or _base(rep, ".nsys-rep") + ".sqlite"
+    if os.path.exists(out) and opts.get("force-overwrite") != "true":
+        print(f"nsys export: {out} already exists; use --force-overwrite=true", file=sys.stderr)
+        return 1
+    with open(rep) as f:
+        meta = json.load(f)
+    ranks = []
+    if os.path.exists(meta["events"]):
+        with open(meta["events"]) as f:
+            ranks = [json.loads(line) for line in f if line.strip()]
+    drop = os.environ.get("FAKE_NSYS_DROP_RANK_TAIL") == "1" and meta["capture_range"] == "cudaProfilerApi"
+    for i, r in enumerate(ranks):
+        r["drop_last"] = 3 if drop and r.get("rank", i) == 1 else 0
+
+    from tests.synth_trace import build_trace_db, trace_span
+
+    # the offline driver's tpprof:measure range spans the measured steps in both capture modes
+    measure = trace_span(ranks) if ranks else None
+    build_trace_db(out, ranks, measure=measure)
+    print(f"Exported {out}", flush=True)
+    return 0
+
+
+def status(args: list[str]) -> int:
+    if "--environment" not in args:
+        print("nsys status: only --environment is supported by this fake", file=sys.stderr)
+        return 1
+    print("Timestamp counter supported: Yes\n"
+          "CPU Profiling Environment Check\n"
+          "Root privilege: enabled\n"
+          "Linux Kernel Paranoid Level = 2\n"
+          "Linux Kernel Version = 6.8.0: OK\n"
+          "Linux perf_event_open syscall available: OK\n"
+          "Sampling trigger event available: OK\n"
+          "CPU Profiling Environment (process-tree): OK")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] in (["--version"], ["-v"]):
+        print(VERSION)
+        return 0
+    commands = {"profile": profile, "export": export, "status": status}
+    if not argv or argv[0] not in commands:
+        print(f"nsys: unknown command {argv[0] if argv else ''!r}; usage: nsys [--version] "
+              "<profile|export|status> [options]", file=sys.stderr)
+        return 1
+    return commands[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
