@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -13,12 +14,11 @@ import sys
 import pytest
 
 from tests.conftest import FAKE_BIN, FIXTURES, ROOT, fake_env
-from tpprof import comm_bench, nccltests, stats, vendored
+from tpprof import comm_bench, constants, nccltests, stats, vendored
 
 TORCHRUN = str(FAKE_BIN / "torchrun")
 VENDORED = ROOT / "third_party" / "vllm_benchmarks"
-M3_KEYS = {"impl", "variant", "mode", "bytes", "n", "world_size", "median_us", "p25_us", "p75_us",
-           "algbw_GBps", "busbw_GBps"}
+M3_KEYS = {"impl", "variant", "mode", "bytes", "n", "median_us", "p25_us", "p75_us", "algbw_GBps", "busbw_GBps"}
 
 
 def run(argv: list[str], tmp_path, **env: str) -> subprocess.CompletedProcess:
@@ -56,6 +56,11 @@ def test_variant_env_diagnostic_run_adds_nccl_debug():
     env = comm_bench.variant_env("tree", "LL128", debug_dir="/r/x")
     assert env == {"NCCL_ALGO": "allreduce:tree", "NCCL_PROTO": "allreduce:LL128", "NCCL_DEBUG": "INFO",
                    "NCCL_DEBUG_SUBSYS": "INIT,ENV,TUNING", "NCCL_DEBUG_FILE": "/r/x/nccl.%h.%p.log"}
+
+
+def test_variant_env_positional_signature_is_algo_proto_only():
+    with pytest.raises(TypeError):
+        comm_bench.variant_env("tree", "LL128", "/r/x")   # debug_dir is keyword-only
 
 
 def test_torchrun_argv_exact():
@@ -104,7 +109,7 @@ def test_synthetic_m3_through_fake_torchrun_recovers_alpha_beta(tmp_path):
     assert len(rows) == 2 * len(comm_bench.SIZES)
     for r in rows:
         assert set(r) == M3_KEYS
-        assert r["impl"] == "torch_nccl" and r["variant"] == "none:none" and r["world_size"] == 2
+        assert r["impl"] == "torch_nccl" and r["variant"] == "none:none"
         assert r["n"] == 50
         assert r["p25_us"] <= r["median_us"] <= r["p75_us"]
         assert r["busbw_GBps"] == pytest.approx(r["algbw_GBps"])
@@ -130,12 +135,13 @@ def test_synthetic_m3_is_deterministic_and_labels_the_variant(tmp_path):
     assert {r["variant"] for r in rows} == {"ring:LL"} and {r["mode"] for r in rows} == {"graph"}
 
 
-def test_m3_refuses_a_variant_label_that_does_not_match_the_nccl_env(tmp_path):
+@pytest.mark.parametrize("env", [{}, {"NCCL_ALGO": ""}, {"NCCL_ALGO": "allreduce:tree"}])
+def test_m3_labels_rows_with_the_variant_as_given_and_does_not_check_the_env(tmp_path, env):
+    # --variant only labels rows; pairing it with variant_env is the caller's job (no exit on a mismatch).
     out = tmp_path / "m3.jsonl"
-    p = run(comm_bench.torchrun_argv(str(out), "eager", ("ring", "LL"), torchrun=TORCHRUN), tmp_path)
-    assert p.returncode == 2
-    assert "NCCL_ALGO" in p.stderr and "allreduce:ring" in p.stderr
-    assert not out.exists()
+    p = run(comm_bench.torchrun_argv(str(out), "eager", ("ring", "LL"), torchrun=TORCHRUN), tmp_path, **env)
+    assert p.returncode == 0, p.stderr
+    assert {r["variant"] for r in comm_bench.load_rows(str(out))} == {"ring:LL"}
 
 
 def test_synthetic_diagnostic_run_writes_a_parseable_nccl_debug_file(tmp_path):
@@ -235,14 +241,17 @@ def test_vendored_writer_output_parses_with_parse_m2(tmp_path):
     assert not out.exists()
     save(entries, 2, argparse.Namespace(output_file=str(out)), 0)
     save(entries, 2, argparse.Namespace(output_file=str(out)), 0)   # a rerun overwrites, never duplicates
-    assert all(json.loads(line) for line in out.read_text().splitlines())
+    lines = out.read_text().splitlines()
+    assert all(json.loads(line) for line in lines)
+    assert all(isinstance(json.loads(line)["ms"], float) for line in lines)   # AM31: float ms, never null
+    assert "null" not in out.read_text()
     rows = vendored.parse_m2(str(out))
     assert len(rows) == 6
     assert rows[0] == {"op": "standard_allreduce__native_rms_norm", "num_tokens": 1, "bytes": 8192,
                        "backend": "standard", "oneshot": None, "ms": 0.02}
     assert rows[1] == {"op": "flashinfer_trtllm_fused_allreduce_rmsnorm_oneshot", "num_tokens": 1, "bytes": 8192,
                        "backend": "trtllm", "oneshot": True, "ms": 0.008}
-    assert rows[2]["backend"] == "mnnvl" and rows[2]["oneshot"] is False and rows[2]["ms"] is None  # FAILED
+    assert rows[2]["backend"] == "mnnvl" and rows[2]["oneshot"] is False and rows[2]["ms"] == float("inf")  # FAILED
     assert rows[5]["bytes"] == 64 * 2**20
 
 
@@ -266,6 +275,14 @@ def test_parse_m2_names_a_missing_key(tmp_path):
         vendored.parse_m2(str(out))
     out.write_text("")
     with pytest.raises(ValueError, match="no rows"):
+        vendored.parse_m2(str(out))
+
+
+def test_parse_m2_rejects_a_non_float_ms(tmp_path):
+    out = tmp_path / "m2.jsonl"
+    out.write_text(json.dumps({"num_tokens": 1, "hidden_dim": 4096, "dtype": "bfloat16",
+                               "op": "standard_allreduce__native_rms_norm", "ms": None}) + "\n")
+    with pytest.raises(ValueError, match="line 1 ms is not a number"):
         vendored.parse_m2(str(out))
 
 
@@ -375,3 +392,19 @@ def test_nccltests_parse_json_names_missing_results(tmp_path):
     path.write_text(json.dumps({"version": 4, "nccl_version": 23007, "config": {"graph": 0}}))
     with pytest.raises(ValueError, match="results"):
         nccltests.parse_json(str(path))
+
+
+# ---------------------------------------------------------------- pinned constants come from tpprof.constants
+
+
+def test_pinned_values_are_imported_from_constants_not_retyped():
+    assert nccltests.NCCL_TESTS_VERSION == constants.NCCL_TESTS_VERSION == "2.20.0"
+    assert nccltests.NCCL_TESTS_TARBALL == constants.NCCL_TESTS_TARBALL
+    assert (nccltests.WORKSPACE, nccltests.NCCL_HOME, nccltests.BIN_DIR) == (
+        constants.BOX_WORKSPACE, constants.NCCL_TESTS_NCCL_HOME, constants.NCCL_TESTS_BIN_DIR)
+    assert constants.NCCL_TESTS_BIN_DIR == "/workspace/nccl-tests-2.20.0/build"
+    assert vendored.HIDDEN == constants.LLAMA31_8B.hidden
+    for mod in (nccltests, vendored, comm_bench):
+        src = pathlib.Path(mod.__file__).read_text()
+        code = src.split('"""', 2)[2]   # skip the module docstring
+        assert '"2.20.0"' not in code and '"/workspace' not in code and "= 4096" not in code, mod.__name__

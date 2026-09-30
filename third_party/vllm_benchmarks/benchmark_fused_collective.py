@@ -860,7 +860,7 @@ def save_results_to_file(
 ):
     """Save benchmark results as JSON lines, one per (num_tokens, op) (only on rank 0).
 
-    A failed op (time ``inf``) is written with ``"ms": null``.
+    ``ms`` is always the script's float; a failed op keeps its ``inf`` (json writes ``Infinity``).
     """
     if rank != 0:
         return
@@ -874,7 +874,7 @@ def save_results_to_file(
                     "dtype": entry["dtype"],
                     "use_residual": entry["use_residual"],
                     "op": op_name,
-                    "ms": None if time_ms == float("inf") else time_ms,
+                    "ms": float(time_ms),
                 }
                 f.write(json.dumps(line) + "\n")
 

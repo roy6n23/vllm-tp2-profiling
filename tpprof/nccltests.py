@@ -9,13 +9,10 @@ from __future__ import annotations
 
 import json
 
-from tpprof.constants import TORCH_CUDA
-
-NCCL_TESTS_VERSION = "2.20.0"
-NCCL_TESTS_TARBALL = f"https://github.com/NVIDIA/nccl-tests/archive/refs/tags/v{NCCL_TESTS_VERSION}.tar.gz"
-WORKSPACE = "/workspace"
-NCCL_HOME = f"{WORKSPACE}/nccl-home"
-BIN_DIR = f"{WORKSPACE}/nccl-tests-{NCCL_TESTS_VERSION}/build"
+from tpprof.constants import BOX_WORKSPACE as WORKSPACE
+from tpprof.constants import NCCL_TESTS_BIN_DIR as BIN_DIR
+from tpprof.constants import NCCL_TESTS_NCCL_HOME as NCCL_HOME
+from tpprof.constants import NCCL_TESTS_TARBALL, NCCL_TESTS_VERSION, TORCH_CUDA
 # The pip NCCL package dir (nvidia.nccl is a namespace package without __file__, so ask importlib; D7-11).
 NCCL_PKG_CMD = ("python3 -c \"import importlib.util as u;"
                 "print(list(u.find_spec('nvidia.nccl').submodule_search_locations)[0])\"")

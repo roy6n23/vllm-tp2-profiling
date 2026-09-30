@@ -21,8 +21,10 @@ import os
 import pathlib
 import sys
 
+from tpprof.constants import LLAMA31_8B
+
 M2_TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
-HIDDEN = 4096
+HIDDEN = LLAMA31_8B.hidden
 THIRD_PARTY = pathlib.Path(__file__).resolve().parent.parent / "third_party" / "vllm_benchmarks"
 _ITEMSIZE = {"bfloat16": 2, "float16": 2, "float32": 4}
 _M2_KEYS = ("num_tokens", "hidden_dim", "dtype", "op", "ms")
@@ -82,7 +84,8 @@ def _op_backend(op: str) -> tuple[str, bool | None]:
 def parse_m2(path: str) -> list[dict]:
     """The vendored M2 JSONL -> rows ``{"op", "num_tokens", "bytes", "backend", "oneshot", "ms"}``.
     backend is ``trtllm`` / ``mnnvl`` for FlashInfer ops, ``standard`` for vLLM's all-reduce dispatch + RMSNorm;
-    oneshot is None for standard ops. ms is None where the script recorded a failure (its ``inf``)."""
+    oneshot is None for standard ops. ms is a float (AM31); a failed op is ``inf``, the script's own failure value,
+    so a failure is never read as a time."""
     rows = []
     with open(path) as f:
         for i, line in enumerate(f, 1):
@@ -92,11 +95,13 @@ def parse_m2(path: str) -> list[dict]:
             missing = [k for k in _M2_KEYS if k not in d]
             if missing:
                 raise ValueError(f"{path}: line {i} lacks {', '.join(missing)}")
+            if isinstance(d["ms"], bool) or not isinstance(d["ms"], (int, float)):
+                raise ValueError(f"{path}: line {i} ms is not a number: {d['ms']!r}")
             backend, oneshot = _op_backend(d["op"])
             rows.append({"op": d["op"], "num_tokens": d["num_tokens"],
                          "bytes": d["num_tokens"] * d["hidden_dim"] * _ITEMSIZE[d["dtype"]],
                          "backend": backend, "oneshot": oneshot,
-                         "ms": None if d["ms"] is None else float(d["ms"])})
+                         "ms": float(d["ms"])})
     if not rows:
         raise ValueError(f"{path}: no rows")
     return rows

@@ -20,6 +20,13 @@ NSYS_VERSION = "2026.5.1"
 NSYS_DEFAULT_PATH = "/opt/nvidia/nsight-systems-cli/2026.5.1/target-linux-x64/nsys"
 NSYS_APT_PACKAGE = "nsight-systems-cli-2026.5.1"
 
+# M4 cross-check: nccl-tests built on the box against the image's NCCL (spec 4.6, AM31, D7-11).
+BOX_WORKSPACE = "/workspace"
+NCCL_TESTS_VERSION = "2.20.0"
+NCCL_TESTS_TARBALL = f"https://github.com/NVIDIA/nccl-tests/archive/refs/tags/v{NCCL_TESTS_VERSION}.tar.gz"
+NCCL_TESTS_NCCL_HOME = f"{BOX_WORKSPACE}/nccl-home"
+NCCL_TESTS_BIN_DIR = f"{BOX_WORKSPACE}/nccl-tests-{NCCL_TESTS_VERSION}/build"
+
 
 def nsys_path() -> str:
     """nsys executable; the dry run points TPPROF_NSYS at the fake (spec AM18)."""

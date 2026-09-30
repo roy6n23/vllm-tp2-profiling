@@ -14,15 +14,17 @@ and runs them under `torchrun` (spec section 4.6, AM25, AM31):
   `HIDDEN_SIZE` to 4096 and calls `vllm.distributed.parallel_state.init_distributed_environment(..., backend="gloo")`
   before `main()`. Without that call v0.30.0 drops FlashInfer from the results.
 - `benchmark_fused_collective.py` (M2) is **modified** (AM31): `pandas` and the markdown report are removed, and
-  `save_results_to_file` writes one JSON line per (num_tokens, op) to `--output-file`, with `"ms": null` for a
-  failed op. The file is overwritten, not appended to, so a rerun never duplicates rows.
+  `save_results_to_file` writes one JSON line per (num_tokens, op) to `--output-file`. `ms` is always a float
+  (AM31): a failed op keeps the script's own `inf`, which Python's `json` writes as `Infinity` and reads back as
+  `float("inf")`. `tpprof.vendored.parse_m2` derives backend and oneshot from the op name. The file is
+  overwritten, not appended to, so a rerun never duplicates rows.
 
 ## SHA-256
 
 - `49421414b5e9d51be04f95c4403b5c8ac8d014c0925d149af28babf6cafee6ca`  `upstream/benchmark_device_communicators.py`
 - `49421414b5e9d51be04f95c4403b5c8ac8d014c0925d149af28babf6cafee6ca`  `vendored/benchmark_device_communicators.py`
 - `8edf7657c04ad6cb32f8f3cf45888c0d8d582f8866066b74cf59b74a79444c78`  `upstream/benchmark_fused_collective.py`
-- `12be53ee72e5e29c0a7ace33600024b82cb8269a8c290cafe77f75499935c108`  `vendored/benchmark_fused_collective.py`
+- `bfc2082b0461ee263c99313ff40d141d5b76c3af0c2e5db44623980dd6eca6ad`  `vendored/benchmark_fused_collective.py`
 
 ## Diff of `benchmark_fused_collective.py`
 
@@ -111,7 +113,7 @@ and runs them under `torchrun` (spec section 4.6, AM25, AM31):
 -    """Save benchmark results to markdown file (only on rank 0)."""
 +    """Save benchmark results as JSON lines, one per (num_tokens, op) (only on rank 0).
 +
-+    A failed op (time ``inf``) is written with ``"ms": null``.
++    ``ms`` is always the script's float; a failed op keeps its ``inf`` (json writes ``Infinity``).
 +    """
      if rank != 0:
          return
@@ -128,7 +130,7 @@ and runs them under `torchrun` (spec section 4.6, AM25, AM31):
 +                    "dtype": entry["dtype"],
 +                    "use_residual": entry["use_residual"],
 +                    "op": op_name,
-+                    "ms": None if time_ms == float("inf") else time_ms,
++                    "ms": float(time_ms),
 +                }
 +                f.write(json.dumps(line) + "\n")
  

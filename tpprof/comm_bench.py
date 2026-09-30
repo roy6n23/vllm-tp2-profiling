@@ -2,12 +2,13 @@
 
 Run on the box as ``torchrun --nproc-per-node 2 -m tpprof.comm_bench ...`` (see ``torchrun_argv``). The NCCL
 variant is chosen by the environment of the torchrun process (``variant_env``), because NCCL reads NCCL_ALGO and
-NCCL_PROTO once at communicator init; ``--variant`` only labels the rows and is checked against that
-environment. ``--synthetic`` writes rows of the same shape without importing torch (tests, dry runs).
+NCCL_PROTO once at communicator init; ``--variant`` only labels the rows, so the caller passes the label and the
+``variant_env`` of the same variant together. ``--synthetic`` writes rows of the same shape without importing
+torch (tests, dry runs).
 
 Rank 0 writes one JSONL row per (mode, size):
-``{"impl", "variant", "mode", "bytes", "n", "world_size", "median_us", "p25_us", "p75_us", "algbw_GBps",
-"busbw_GBps"}``, where ``n`` is the number of timed samples and busbw = algbw * 2 (w - 1) / w (= algbw at w = 2).
+``{"impl", "variant", "mode", "bytes", "n", "median_us", "p25_us", "p75_us", "algbw_GBps", "busbw_GBps"}``,
+where ``n`` is the number of timed samples and busbw = algbw * 2 (w - 1) / w, which is algbw for the 2-rank run.
 """
 from __future__ import annotations
 
@@ -28,8 +29,8 @@ VARIANTS = ((None, None), ("ring", "LL"), ("ring", "LL128"), ("ring", "Simple"),
             ("tree", "LL"), ("tree", "LL128"), ("tree", "Simple"), ("nvls", "Simple"))
 MODES = ("eager", "graph")
 IMPL = "torch_nccl"
-ROW_KEYS = ("impl", "variant", "mode", "bytes", "n", "world_size", "median_us", "p25_us", "p75_us",
-            "algbw_GBps", "busbw_GBps")
+ROW_KEYS = ("impl", "variant", "mode", "bytes", "n", "median_us", "p25_us", "p75_us", "algbw_GBps",
+            "busbw_GBps")
 ITERS, WARMUP, GRAPH_OPS = 50, 10, 20
 
 # Synthetic timing model: alpha 6 us, beta 260 GB/s, +-2 % deterministic noise.
@@ -59,9 +60,10 @@ def parse_variant(label: str) -> tuple[str | None, str | None]:
     return (None if algo == "none" else algo), (None if proto == "none" else proto)
 
 
-def variant_env(algo: str | None, proto: str | None, debug_dir: str | None = None) -> dict[str, str]:
+def variant_env(algo: str | None, proto: str | None, *, debug_dir: str | None = None) -> dict[str, str]:
     """Environment for one NCCL variant, in the per-function form so other collectives keep their defaults
-    (D7-2). A diagnostic run (``debug_dir`` set; never a timed run) also logs INIT, ENV and TUNING (D7-4)."""
+    (D7-2). A diagnostic run also logs INIT, ENV and TUNING (D7-4) to ``<debug_dir>/nccl.%h.%p.log``; the
+    keyword-only ``debug_dir`` supplies that ``<dir>`` and marks the run as diagnostic."""
     env = {}
     if algo is not None:
         env["NCCL_ALGO"] = f"allreduce:{algo}"
@@ -122,16 +124,9 @@ def load_rows(path: str) -> list[dict]:
 def _row(variant: str, mode: str, size: int, world_size: int, times_s: list[float]) -> dict:
     s = stats.summarize(times_s)
     algbw = size / s["median"] / 1e9
-    return {"impl": IMPL, "variant": variant, "mode": mode, "bytes": size, "n": s["n"], "world_size": world_size,
+    return {"impl": IMPL, "variant": variant, "mode": mode, "bytes": size, "n": s["n"],
             "median_us": s["median"] * 1e6, "p25_us": s["p25"] * 1e6, "p75_us": s["p75"] * 1e6,
             "algbw_GBps": algbw, "busbw_GBps": algbw * 2 * (world_size - 1) / world_size}
-
-
-def _env_mismatch(variant: tuple, environ) -> str | None:
-    want = variant_env(*variant)
-    bad = [f"{k}={environ.get(k)!r} (variant {variant_label(variant)} needs {want.get(k)!r})"
-           for k in ("NCCL_ALGO", "NCCL_PROTO") if environ.get(k) != want.get(k)]
-    return "; ".join(bad) or None
 
 
 def _write_rows(path: str, rows: list[dict]) -> None:
@@ -247,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--iters", type=int, default=ITERS)
     ap.add_argument("--warmup", type=int, default=WARMUP)
     ap.add_argument("--graph-ops", type=int, default=GRAPH_OPS)
-    ap.add_argument("--variant", default="none:none", help="ALGO:PROTO label; must match NCCL_ALGO/NCCL_PROTO")
+    ap.add_argument("--variant", default="none:none", help="ALGO:PROTO row label (none for the default); the env sets NCCL_ALGO/NCCL_PROTO")
     ap.add_argument("--synthetic", action="store_true", help="no torch: rows from t = 6 us + s / 260 GB/s")
     args = ap.parse_args(argv)
 
@@ -259,10 +254,6 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         ap.error(str(e))
     args.variant = variant_label(variant)
-    mismatch = _env_mismatch(variant, os.environ)
-    if mismatch:
-        sys.stderr.write(f"comm_bench: NCCL environment does not match --variant: {mismatch}\n")
-        return 2
 
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
