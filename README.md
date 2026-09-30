@@ -83,7 +83,7 @@ changed the measurements.
 | **TP1** | 1 | `vllm serve M -tp 1 --distributed-executor-backend mp`, `CUDA_VISIBLE_DEVICES=0` | baseline |
 | **TP2** | 2 | `vllm serve M -tp 2 --distributed-executor-backend mp` | tensor parallel |
 | **DP2** | 2 | `vllm serve M -tp 1 -dp 2 --api-server-count 1` | primary replica control |
-| DP2-rand (P2) | 2 | two `vllm serve M -tp 1`, on GPU0 and GPU1, two clients at half the rate with different seeds | sensitivity arm: random split |
+| DP2-rand (P2) | 2 | two `vllm serve M -tp 1 --distributed-executor-backend mp`, on GPU0 and GPU1, two clients at half the rate with different seeds | sensitivity arm: random split |
 
 Offline, DP2 is derived rather than run: a DP2 batch of B requests is two
 independent TP1 engines at B/2, so the TP1 decode grid includes the half-batch
@@ -110,12 +110,17 @@ Every default that could differ between offline and online use is written out:
 After every engine start, `tpprof/logparse.py` reads the engine log and fails
 the run unless the expected lines are present: the vLLM version, the chunked
 prefill budget, `Using V2 Model Runner`, the FLASH_ATTN backend with
-FlashAttention 3, the KV cache size, and for TP2 the all-reduce backend list,
-the enabled `allreduce_rms` fusion and the FlashInfer workspace line. Known
-failure strings (a disabled fusion, a disabled custom all-reduce, a failed
-symmetric-memory init, a full `/dev/shm`) also fail the run. The normal
-FlashInfer fallback from the `mnnvl` to the `trtllm` backend is recorded, not
-failed.
+FlashAttention 3, and one KV cache size line per engine. For TP2 the
+all-reduce lines are checked per arm: AR0, AR1, G1, PCon and API2 need
+FLASHINFER first in the backend list plus the FlashInfer workspace line
+(FIBtrtllm needs that workspace line with `backend=trtllm`), AR2 needs the
+list to be exactly `['CUSTOM', 'PYNCCL']`, AR3 exactly `['PYNCCL']`, and G2
+needs FLASHINFER first and the enforce-eager line. The `Enabled custom
+fusions` line is recorded but not checked: whether the fusion actually ran is
+decided from the kernel names in the trace. Known failure strings (a disabled
+fusion, a disabled custom all-reduce, a failed symmetric-memory init, a full
+`/dev/shm`) also fail the run. The normal FlashInfer fallback from the `mnnvl`
+to the `trtllm` backend is recorded, not failed.
 
 ### Workloads
 
