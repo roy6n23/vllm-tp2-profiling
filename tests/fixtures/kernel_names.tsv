@@ -1,0 +1,20 @@
+void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern)1, __nv_bfloat16, 2, true, true>(flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<__nv_bfloat16>)	all_reduce	1
+void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_twoshot_sync<(flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern)1, __nv_bfloat16, 2, true>(flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<__nv_bfloat16>)	all_reduce	1
+void flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel<(unsigned char)2, __nv_bfloat16, true, (flashinfer::QuantType)0>(flashinfer::trtllm_mnnvl_allreduce::AllReduceFusionParams)	all_reduce	1
+void flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<(unsigned char)2, __nv_bfloat16, true>(flashinfer::trtllm_mnnvl_allreduce::AllReduceFusionParams)	all_reduce	1
+void flashinfer::trtllm_mnnvl_allreduce::rmsNormLamport<__nv_bfloat16, (flashinfer::QuantType)0, true, 8>(flashinfer::trtllm_mnnvl_allreduce::RMSNormParams)	all_reduce	0
+void vllm::cross_device_reduce_1stage<__nv_bfloat16, 2>(vllm::RankData*, vllm::RankSignals, vllm::Signal*, __nv_bfloat16*, int, int)	all_reduce	1
+ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)	all_reduce	1
+ncclDevKernel_AllReduce_Sum_bf16_TREE_LL(ncclDevKernelArgsStorage<4096ul>)	all_reduce	1
+void (anonymous namespace)::two_shot_all_reduce_kernel_inplace<__nv_bfloat16, 16, 2>(__nv_bfloat16**, unsigned long, unsigned long, unsigned int**, unsigned long, unsigned long)	all_reduce	1
+ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)	all_gather	0
+void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, cute::C<1>, cute::C<1>>, cute::tuple<cute::C<128>, cute::C<128>, cute::C<128>>, 128, cutlass::bfloat16_t, float, cutlass::arch::Sm90, true, false, false, true, false, false, true, true, false, true, false, false>>>>(flash::FlashAttnFwdSm90<...>::Params)	attention	0
+nvjet_tst_128x256_64x4_1x2_h_bz_coopA_TNT	gemm	0
+sm90_xmma_gemm_bf16bf16_bf16f32_f32_tn_n_tilesize128x128x64_warpgroupsize1x1x1_execute_segment_k_off_kernel__5x_cublas	gemm	0
+triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_1	norm_act_rope	0
+triton_poi_fused_mul_silu_2	norm_act_rope	0
+void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, __nv_bfloat16, (vllm::Fp8KVCacheDataType)0>(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16*, __nv_bfloat16*, long const*, int, int, int, int, int, int, float const*, float const*)	norm_act_rope	0
+void vllm::fused_add_rms_norm_kernel<c10::BFloat16, 8>(c10::BFloat16*, c10::BFloat16*, c10::BFloat16 const*, float, int, int)	norm_act_rope	0
+void at::native::(anonymous namespace)::distribution_elementwise_grid_stride_kernel<float, 4, at::native::templates::cuda::exponential_kernel<at::CUDAGeneratorImpl*>(at::TensorIteratorBase&, double, at::CUDAGeneratorImpl*)::{lambda()#1}::operator()() const::{lambda(at::cuda::detail::Philox4_32_10&)#1}>(long, at::PhiloxCudaState, ...)	sampling	0
+void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4>>(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4>)	sampling	0
+some_unknown_kernel_xyz	other	0
