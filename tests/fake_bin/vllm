@@ -1,0 +1,1118 @@
+#!/usr/bin/env python3
+"""Fake vLLM 0.30.0 CLI: --version, serve, bench serve, bench latency (stdlib only).
+
+The formats follow the real 0.30.0 captures: startup log lines (contract C6), the SSE stream the real
+client parses (D4-20), the bench-serve result JSON key order (C7), the bench-latency JSON (C3), and the
+Prometheus names on /metrics (D5-1). Fault injection and timing use the C5 FAKE_* variables.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import http.client
+import http.server
+import json
+import math
+import os
+import random
+import signal
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests.fakes import common  # noqa: E402
+
+VERSION = "0.30.0"
+NCCL_VERSION = "2.30.7"
+HELP_FIXTURES = {
+    ("serve",): "serve_help_all.txt",
+    ("bench", "serve"): "bench_serve_help.txt",
+    ("bench", "latency"): "bench_latency_help.txt",
+}
+PLAIN_HELP_LINES = 60
+USED_MIB = 73403                      # 0.90 x 81559 MiB, what --gpu-memory-utilization 0.90 takes
+KV_TOKENS_TP1, KV_TOKENS_TP2 = 420959, 955000
+POTENTIAL_AR = ["FLASHINFER_PCIE_IPC", "FLASHINFER", "NCCL_SYMM_MEM", "QUICK_REDUCE", "AITER_CUSTOM",
+                "CUSTOM", "SYMM_MEM", "PYNCCL"]
+FINISHED_REASONS = ("stop", "length", "abort", "error", "repetition")
+E2E_BUCKETS = (0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 120.0,
+               240.0, 480.0, 960.0, 1920.0, 7680.0)
+GIB = 1 << 30
+KV_BYTES_PER_TOKEN = 131072           # Llama-3.1-8B bf16: 2 * 32 layers * 8 kv heads * 128 * 2 B
+
+
+# ================================================================ logging
+
+
+class Log:
+    """vLLM's line format with the per-process prefix (D5-6, D5-7); uvicorn lines go to stderr."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.api_pid = os.getpid()
+
+    def pid(self, proc: str, rank: int = 0) -> int:
+        """One fake pid per process; a TP worker keeps its pid when 'Worker' becomes 'Worker_TP<r>'."""
+        if proc == "APIServer":
+            return self.api_pid
+        if proc[-1].isdigit():
+            rank = int(proc[-1])
+        return self.api_pid + (1 if proc.startswith("EngineCore") else 10) + rank
+
+    def write(self, stream, text: str) -> None:
+        with self.lock:
+            stream.write(text)
+            stream.flush()
+
+    def __call__(self, proc: str, level: str, src: str, msg: str, rank: int = 0) -> None:
+        ts = time.strftime("%m-%d %H:%M:%S")
+        self.write(sys.stdout, f"({proc} pid={self.pid(proc, rank)}) {level} {ts} [{src}] {msg}\n")
+
+    def uvicorn(self, msg: str) -> None:
+        self.write(sys.stderr, f"(APIServer pid={self.api_pid}) INFO:     {msg}\n")
+
+
+# ================================================================ vllm serve
+
+
+def serve_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="vllm serve", allow_abbrev=False)
+    p.add_argument("model_tag", nargs="?", default="Qwen/Qwen3-0.6B")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+    p.add_argument("--data-parallel-size", "-dp", type=int, default=1)
+    p.add_argument("--api-server-count", type=int, default=1)
+    p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--compilation-config", "-cc", default=None)
+    p.add_argument("--disable-custom-all-reduce", action="store_true")
+    p.add_argument("--served-model-name", nargs="+", default=None)
+    p.add_argument("--enable-prefix-caching", dest="enable_prefix_caching", action="store_true", default=None)
+    p.add_argument("--no-enable-prefix-caching", dest="enable_prefix_caching", action="store_false")
+    p.add_argument("--max-model-len", type=int, default=131072)
+    p.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--kv-cache-dtype", default="auto")
+    return p
+
+
+def non_default_args(model: str, argv: list[str]) -> dict:
+    """What the real 'non-default args' line shows: the flags given on the command line."""
+    short = {"-tp": "tensor_parallel_size", "-dp": "data_parallel_size", "-cc": "compilation_config",
+             "-O": "optimization_level"}
+    out: dict = {"model_tag": model}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith("-"):
+            i += 1
+            continue
+        key = short.get(tok, tok.lstrip("-").replace("-", "_"))
+        if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            value: object = argv[i + 1]
+            for cast in (int, float, json.loads):
+                try:
+                    value = cast(argv[i + 1])
+                    break
+                except ValueError:
+                    continue
+            out[key] = value
+            i += 2
+        else:
+            out[key[3:] if key.startswith("no_") else key] = not key.startswith("no_")
+            i += 1
+    out["model"] = model
+    return out
+
+
+class ServeConfig:
+    def __init__(self, ns: argparse.Namespace, argv: list[str]) -> None:
+        self.argv = argv
+        self.model = ns.model_tag
+        self.served = ns.served_model_name or [ns.model_tag]
+        self.port = ns.port
+        self.tp = ns.tensor_parallel_size
+        self.dp = ns.data_parallel_size
+        self.api_servers = ns.api_server_count
+        self.eager = ns.enforce_eager
+        self.cc = json.loads(ns.compilation_config) if ns.compilation_config else {}
+        self.disable_car = ns.disable_custom_all_reduce
+        self.prefix_caching = True if ns.enable_prefix_caching is None else ns.enable_prefix_caching
+        self.max_model_len = ns.max_model_len
+        self.mnbt = ns.max_num_batched_tokens
+        self.seed = ns.seed
+        self.kv_dtype = ns.kv_cache_dtype
+        self.kv_tokens = KV_TOKENS_TP2 if self.tp == 2 else KV_TOKENS_TP1
+
+    @property
+    def cudagraph_mode(self) -> str:
+        return "NONE" if self.eager else str(self.cc.get("cudagraph_mode", "FULL_AND_PIECEWISE")).upper()
+
+    @property
+    def fuse_allreduce_rms(self) -> bool:
+        return (self.tp > 1 and not self.eager
+                and (self.cc.get("pass_config") or {}).get("fuse_allreduce_rms") is True)
+
+    def engine_names(self) -> list[str]:
+        return ["EngineCore"] if self.dp == 1 else [f"EngineCore_DP{i}" for i in range(self.dp)]
+
+    def ar_backends(self) -> list[str]:
+        """The dispatch list, gated like CudaCommunicator (cuda_communicator.py:300-326)."""
+        gates = {
+            "FLASHINFER_PCIE_IPC": common.env_bool01("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"),
+            "FLASHINFER": common.env_bool01("VLLM_ALLREDUCE_USE_FLASHINFER", "1"),
+            "NCCL_SYMM_MEM": common.env_bool01("VLLM_USE_NCCL_SYMM_MEM", "0"),
+            "QUICK_REDUCE": False,
+            "AITER_CUSTOM": False,
+            "CUSTOM": not self.disable_car,
+            "SYMM_MEM": common.env_bool01("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"),
+            "PYNCCL": True,
+        }
+        return [b for b in POTENTIAL_AR if gates[b]]
+
+    def banner(self) -> str:
+        graph = {"NONE": "<CUDAGraphMode.NONE: 0>", "PIECEWISE": "<CUDAGraphMode.PIECEWISE: 1>",
+                 "FULL": "<CUDAGraphMode.FULL: 2>", "FULL_DECODE_ONLY": "<CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>",
+                 "FULL_AND_PIECEWISE": "<CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>"}.get(self.cudagraph_mode, "None")
+        mode = "<CompilationMode.NONE: 0>" if self.eager else "<CompilationMode.VLLM_COMPILE: 3>"
+        cc = (f"{{'mode': {mode}, 'backend': 'inductor', 'cudagraph_mode': {graph}, 'pass_config': "
+              f"{{'fuse_allreduce_rms': {self.fuse_allreduce_rms}}}, 'max_cudagraph_capture_size': 512}}")
+        return (f"model={self.model!r}, speculative_config=None, tokenizer={self.model!r}, "
+                f"skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, "
+                f"trust_remote_code=False, dtype=torch.bfloat16, max_seq_len={self.max_model_len}, "
+                f"download_dir=None, load_format=auto, tensor_parallel_size={self.tp}, pipeline_parallel_size=1, "
+                f"data_parallel_size={self.dp}, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, "
+                f"disable_custom_all_reduce={self.disable_car}, quantization=None, quantization_config=None, "
+                f"enforce_eager={self.eager}, enable_return_routed_experts=False, kv_cache_dtype={self.kv_dtype}, "
+                f"device_config=cuda, seed={self.seed}, served_model_name={self.served[0]}, "
+                f"enable_prefix_caching={self.prefix_caching}, enable_chunked_prefill=True, pooler_config=None, "
+                f"compilation_config={cc}")
+
+
+def api_startup_lines(cfg: ServeConfig, log: Log) -> None:
+    log("APIServer", "INFO", "utils.py:299", f"vLLM API server version {VERSION}")
+    log("APIServer", "INFO", "api_utils.py:286", f"non-default args: {non_default_args(cfg.model, cfg.argv)}")
+    log("APIServer", "INFO", "scheduler.py:289",
+        f"Chunked prefill is enabled with max_num_batched_tokens={cfg.mnbt}.")
+    if cfg.eager:
+        log("APIServer", "WARNING", "vllm.py:1548", "Enforce eager set, disabling torch.compile and CUDAGraphs. "
+            "This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none")
+    if cfg.fuse_allreduce_rms:
+        log("APIServer", "INFO", "compilation.py:337", "Enabled custom fusions: allreduce_rms")
+
+
+def flashinfer_workspace_lines(log: Log, proc: str) -> None:
+    """FlashInfer AR+norm workspace (flashinfer_all_reduce.py:92-222): mnnvl, or the trtllm fallback."""
+    backend = os.environ.get("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "auto")
+    src = "flashinfer_all_reduce.py"
+    if backend != "trtllm" and common.env_flag("FAKE_VLLM_NO_MULTICAST"):
+        log(proc, "WARNING", f"{src}:95", "FlashInfer MNNVL multicast is unavailable on the current topology.")
+        log(proc, "WARNING", f"{src}:101", "Failed to initialize FlashInfer All Reduce workspace: multicast is not "
+            "supported on this device. This is expected on GPUs without NVSwitch (e.g., NVLink bridge-only or "
+            "PCIe topologies).")
+        if backend == "mnnvl":
+            log(proc, "ERROR", f"{src}:222",
+                "Failed to initialize FlashInfer Allreduce norm fusion workspace with backend=mnnvl")
+            return
+        log(proc, "WARNING", f"{src}:209", "FlashInfer mnnvl allreduce workspace unavailable (likely no NVSwitch "
+            "multicast support); falling back to trtllm backend for single node.")
+        backend = "trtllm"
+    elif backend == "auto":
+        backend = "mnnvl"
+    log(proc, "INFO", f"{src}:217", f"Initialized FlashInfer Allreduce norm fusion workspace with backend={backend}")
+
+
+def engine_startup_lines(cfg: ServeConfig, log: Log) -> None:
+    graphs = cfg.cudagraph_mode != "NONE"
+    for eng in cfg.engine_names():
+        log(eng, "INFO", "core.py:124", f"Initializing a V1 LLM engine (v{VERSION}) with config: {cfg.banner()}")
+        if cfg.tp > 1:
+            for rank in range(cfg.tp):
+                log("Worker", "INFO", "parallel_state.py:1402",
+                    f"world_size={cfg.tp} rank={rank} local_rank={rank} distributed_init_method="
+                    f"tcp://127.0.0.1:{cfg.port + 1000} backend=nccl", rank=rank)
+            log("Worker", "INFO", "pynccl.py:148", f"vLLM is using nccl=={NCCL_VERSION}")
+            ar = cfg.ar_backends()
+            log("Worker", "INFO", "cuda_communicator.py:319",
+                "Using [" + ", ".join(f"'{b}'" for b in ar) + "] all-reduce backends (in dispatch order) for "
+                "group 'tp:0' out of potential backends: [" + ", ".join(f"'{b}'" for b in POTENTIAL_AR) + "].")
+            log("Worker", "INFO", "gpu_worker.py:441", "Using V2 Model Runner")
+            ranks = [f"Worker_TP{r}" for r in range(cfg.tp)]
+        else:
+            ar = []
+            log(eng, "INFO", "gpu_worker.py:441", "Using V2 Model Runner")
+            ranks = [eng]
+        for proc in ranks:
+            log(proc, "INFO", "cuda.py:478", "Using AttentionBackendEnum.FLASH_ATTN backend.")
+        log(ranks[0], "INFO", "flash_attn.py:1117", "Using FlashAttention version 3")
+        for proc in ranks:
+            log(proc, "INFO", "model_runner.py:429",
+                f"Model loading took {14.99 / cfg.tp:.2f} GiB memory and {12.345678 / cfg.tp:.6f} seconds")
+        if cfg.tp > 1 and "FLASHINFER" in ar:
+            flashinfer_workspace_lines(log, ranks[0])
+        for proc in ranks:
+            log(proc, "INFO", "gpu_worker.py:641",
+                f"Available KV cache memory: {cfg.kv_tokens * KV_BYTES_PER_TOKEN / cfg.tp / GIB:.2f} GiB")
+        log(eng, "INFO", "kv_cache_utils.py:2396",
+            f"GPU KV cache size: {cfg.kv_tokens:,} tokens, Maximum concurrency for {cfg.max_model_len:,} tokens "
+            f"per request: {cfg.kv_tokens / cfg.max_model_len:.2f}x")
+        if graphs:
+            for proc in ranks:
+                log(proc, "INFO", "model_runner.py:1067", "Graph capturing finished in 18 secs, took 0.52 GiB")
+        log(eng, "INFO", "core.py:363", "init engine (profile, create kv cache, warmup model) took 45.67 seconds")
+
+
+class EngineStats:
+    def __init__(self) -> None:
+        self.running = 0
+        self.kv_used = 0
+        self.prompt_tokens = 0
+        self.generation_tokens = 0
+        self.success = {r: 0 for r in FINISHED_REASONS}
+        self.pc_queries = 0
+        self.pc_hits = 0
+        self.e2e: list[float] = []
+        self.window_prompt = 0
+        self.window_gen = 0
+
+
+class ServeState:
+    def __init__(self, cfg: ServeConfig, log: Log) -> None:
+        self.cfg = cfg
+        self.log = log
+        self.lock = threading.Lock()
+        self.engines = [EngineStats() for _ in range(cfg.dp)]
+        self.next_engine = 0
+        self.completions = 0
+        self.seen_prompts: set[str] = set()
+        self.created = time.time()
+        self.crash_after = common.env_int("FAKE_VLLM_CRASH_AFTER", 0)
+        self.gpus: list[int] = []
+        self.tokenizer = load_tokenizer()
+
+    def prompt_tokens(self, prompt: str) -> int:
+        if self.tokenizer is not None:
+            return len(self.tokenizer(prompt)["input_ids"])
+        return int(os.environ.get("FAKE_VLLM_PROMPT_TOKENS") or 1024)
+
+    def begin(self, prompt: str, n_prompt: int) -> int:
+        with self.lock:
+            idx = self.next_engine
+            self.next_engine = (idx + 1) % len(self.engines)
+            e = self.engines[idx]
+            e.running += 1
+            e.kv_used += n_prompt
+            e.prompt_tokens += n_prompt
+            e.window_prompt += n_prompt
+            e.pc_queries += n_prompt
+            if self.cfg.prefix_caching and prompt in self.seen_prompts:
+                e.pc_hits += (n_prompt // 16) * 16
+            self.seen_prompts.add(prompt)
+            return idx
+
+    def token(self, idx: int) -> None:
+        with self.lock:
+            e = self.engines[idx]
+            e.generation_tokens += 1
+            e.window_gen += 1
+            e.kv_used += 1
+
+    def reserve_completion(self) -> bool:
+        """Claim a completion slot before a stream's last token; True for the N-th of FAKE_VLLM_CRASH_AFTER=N.
+
+        Streams past the N-th block here and never finish: the N-th stream exits the process once its
+        response is flushed, so exactly N completions are served.
+        """
+        with self.lock:
+            over = bool(self.crash_after) and self.completions >= self.crash_after
+            if not over:
+                self.completions += 1
+            last = bool(self.crash_after) and self.completions == self.crash_after
+        if over:
+            threading.Event().wait()
+        return last
+
+    def end(self, idx: int, reason: str, n_prompt: int, n_generated: int, e2e_s: float) -> None:
+        with self.lock:
+            e = self.engines[idx]
+            e.running -= 1
+            e.kv_used -= n_prompt + n_generated
+            e.success[reason] += 1
+            e.e2e.append(e2e_s)
+
+    def crash(self) -> None:
+        self.log("EngineCore", "ERROR", "multiproc_executor.py:315",
+                 "Worker proc VllmWorker-0 died unexpectedly (exit code: -9), shutting down executor.")
+        self.log("APIServer", "ERROR", "core_client.py:600", "Engine core proc EngineCore died unexpectedly, "
+                 "shutting down client.")
+        if not common.env_flag("FAKE_VLLM_LEAK_MEM"):
+            common.remove_gpu_state(self.gpus, os.getpid())
+        os._exit(1)
+
+    def stats_lines(self, elapsed: float) -> None:
+        with self.lock:
+            snapshot = []
+            for i, e in enumerate(self.engines):
+                hit = 100.0 * e.pc_hits / e.pc_queries if e.pc_queries else 0.0
+                snapshot.append((i, e.window_prompt / elapsed, e.window_gen / elapsed, e.running,
+                                 100.0 * e.kv_used / self.cfg.kv_tokens, hit))
+                e.window_prompt = e.window_gen = 0
+        for i, pt, gt, running, kv, hit in snapshot:
+            self.log("APIServer", "INFO", "loggers.py:271",
+                     f"Engine {i:03d}: Avg prompt throughput: {pt:.1f} tokens/s, Avg generation throughput: "
+                     f"{gt:.1f} tokens/s, Running: {running} reqs, Waiting: 0 reqs, GPU KV cache usage: "
+                     f"{kv:.1f}%, Prefix cache hit rate: {hit:.1f}%")
+
+    def metrics_text(self) -> str:
+        """Prometheus exposition as prometheus_client renders vLLM's metrics (labels sorted)."""
+        model = self.cfg.served[0]
+        out: list[str] = []
+
+        def family(name: str, kind: str, doc: str, samples: list[tuple[dict, float]]) -> None:
+            out.append(f"# HELP {name} {doc}")
+            out.append(f"# TYPE {name} {kind}")
+            for labels, value in samples:
+                lab = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+                out.append(f"{name}{{{lab}}} {go_float(value)}")
+
+        with self.lock:
+            engines = [(str(i), e) for i, e in enumerate(self.engines)]
+            base = [{"engine": i, "model_name": model} for i, _ in engines]
+            family("vllm:num_requests_running", "gauge", "Number of requests in model execution batches.",
+                   [(b, e.running) for b, (_, e) in zip(base, engines)])
+            family("vllm:num_requests_waiting", "gauge", "Number of requests waiting to be processed.",
+                   [(b, 0) for b in base])
+            family("vllm:kv_cache_usage_perc", "gauge", "KV-cache usage. 1 means 100 percent usage.",
+                   [(b, e.kv_used / self.cfg.kv_tokens) for b, (_, e) in zip(base, engines)])
+            counters = [
+                ("vllm:num_preemptions", "Cumulative number of preemption from the engine.", lambda e: 0),
+                ("vllm:prefix_cache_queries", "Prefix cache queries, in terms of number of queried tokens.",
+                 lambda e: e.pc_queries),
+                ("vllm:prefix_cache_hits", "Prefix cache hits, in terms of number of cached tokens.",
+                 lambda e: e.pc_hits),
+                ("vllm:prompt_tokens", "Number of prefill tokens processed.", lambda e: e.prompt_tokens),
+                ("vllm:generation_tokens", "Number of generation tokens processed.",
+                 lambda e: e.generation_tokens),
+            ]
+            for name, doc, get in counters:
+                family(f"{name}_total", "counter", doc, [(b, get(e)) for b, (_, e) in zip(base, engines)])
+                family(f"{name}_created", "gauge", doc, [(b, self.created) for b in base])
+            doc = "Count of successfully processed requests."
+            success = [(dict(b, finished_reason=r), e.success[r]) for b, (_, e) in zip(base, engines)
+                       for r in FINISHED_REASONS]
+            family("vllm:request_success_total", "counter", doc, success)
+            family("vllm:request_success_created", "gauge", doc, [(lab, self.created) for lab, _ in success])
+            name, doc = "vllm:e2e_request_latency_seconds", "Histogram of e2e request latency in seconds."
+            out.append(f"# HELP {name} {doc}")
+            out.append(f"# TYPE {name} histogram")
+            for b, (_, e) in zip(base, engines):
+                for le in (*E2E_BUCKETS, math.inf):
+                    lab = f'engine="{b["engine"]}",le="{go_float(le)}",model_name="{model}"'
+                    out.append(f"{name}_bucket{{{lab}}} {go_float(sum(1 for x in e.e2e if x <= le))}")
+                lab = f'engine="{b["engine"]}",model_name="{model}"'
+                out.append(f"{name}_count{{{lab}}} {go_float(len(e.e2e))}")
+                out.append(f"{name}_sum{{{lab}}} {go_float(sum(e.e2e))}")
+            out.append(f"# HELP {name}_created {doc}")
+            out.append(f"# TYPE {name}_created gauge")
+            for b in base:
+                out.append(f'{name}_created{{engine="{b["engine"]}",model_name="{model}"}} {go_float(self.created)}')
+        return "\n".join(out) + "\n"
+
+
+def go_float(v: float) -> str:
+    """prometheus_client.utils.floatToGoString."""
+    v = float(v)
+    if v == math.inf:
+        return "+Inf"
+    if v == -math.inf:
+        return "-Inf"
+    if math.isnan(v):
+        return "NaN"
+    s = repr(v)
+    dot = s.find(".")
+    if v > 0 and dot > 6:
+        mantissa = f"{s[0]}.{s[1:dot]}{s[dot + 1:]}".rstrip("0.")
+        return f"{mantissa}e+0{dot - 1}"
+    return s
+
+
+def load_tokenizer():
+    """FAKE_VLLM_TOKENIZER counts prompt tokens with the real tokenizer, only where transformers imports."""
+    path = os.environ.get("FAKE_VLLM_TOKENIZER")
+    if not path:
+        return None
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        return None
+    return AutoTokenizer.from_pretrained(path)
+
+
+def make_handler(state: ServeState):
+    cfg = state.cfg
+    ttft_s = common.env_float("FAKE_VLLM_TTFT_S", 0.02)
+    itl_s = common.env_float("FAKE_VLLM_ITL_S", 0.002)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "uvicorn"
+        sys_version = ""
+
+        def log_message(self, fmt, *args):  # --disable-uvicorn-access-log
+            pass
+
+        def send_body(self, status: int, body: bytes, ctype: str) -> None:
+            self.send_response(status)
+            self.send_header("content-type", ctype)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_json(self, status: int, obj) -> None:
+            self.send_body(status, json.dumps(obj, separators=(",", ":")).encode(), "application/json")
+
+        def do_GET(self):
+            path = urllib.parse.urlsplit(self.path).path
+            if path == "/health":
+                self.send_body(200, b"", "application/json")
+            elif path == "/version":
+                self.send_json(200, {"version": VERSION})
+            elif path == "/v1/models":
+                created = int(time.time())
+                self.send_json(200, {"object": "list", "data": [
+                    {"id": name, "object": "model", "created": created, "owned_by": "vllm", "root": cfg.model,
+                     "parent": None, "max_model_len": cfg.max_model_len,
+                     "permission": [{"id": f"modelperm-{uuid.uuid4().hex}", "object": "model_permission",
+                                     "created": created, "allow_create_engine": False, "allow_sampling": True,
+                                     "allow_logprobs": True, "allow_search_indices": False, "allow_view": True,
+                                     "allow_fine_tuning": False, "organization": "*", "group": None,
+                                     "is_blocking": False}]}
+                    for name in cfg.served]})
+            elif path == "/metrics":
+                self.send_body(200, state.metrics_text().encode(), "text/plain; version=0.0.4; charset=utf-8")
+            else:
+                self.send_json(404, {"detail": "Not Found"})
+
+        def do_POST(self):
+            path = urllib.parse.urlsplit(self.path).path
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if path != "/v1/completions":
+                self.send_json(404, {"detail": "Not Found"})
+                return
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                self.send_json(400, {"error": {"message": "invalid JSON body", "type": "BadRequestError",
+                                               "param": None, "code": 400}})
+                return
+            model = body.get("model")
+            if model not in cfg.served:
+                self.send_json(404, {"error": {"message": f"The model `{model}` does not exist.",
+                                               "type": "NotFoundError", "param": "model", "code": 404}})
+                return
+            self.stream_completion(body, model)
+
+        def write_event(self, obj) -> None:
+            data = ("data: " + (obj if isinstance(obj, str) else json.dumps(obj, separators=(",", ":")))
+                    + "\n\n").encode()
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+            self.wfile.flush()
+
+        def stream_completion(self, body: dict, model: str) -> None:
+            n = int(body.get("max_tokens") or 16)
+            prompt = str(body.get("prompt", ""))
+            n_prompt = state.prompt_tokens(prompt)
+            include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+            rid, created = f"cmpl-{uuid.uuid4().hex}", int(time.time())
+            t0 = time.monotonic()
+            idx = state.begin(prompt, n_prompt)
+            done, reason, last = 0, "abort", False
+            try:
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream; charset=utf-8")
+                self.send_header("transfer-encoding", "chunked")
+                self.end_headers()
+                for i in range(n):
+                    common.fake_sleep(ttft_s if i == 0 else itl_s)
+                    choice = {"index": 0, "text": " Hello", "logprobs": None,
+                              "finish_reason": "length" if i == n - 1 else None, "stop_reason": None,
+                              "prompt_token_ids": None, "token_ids": None}
+                    if i == n - 1:
+                        last = state.reserve_completion()
+                    self.write_event({"id": rid, "object": "text_completion", "created": created, "model": model,
+                                      "choices": [choice]})
+                    state.token(idx)
+                    done += 1
+                if include_usage:
+                    self.write_event({"id": rid, "object": "text_completion", "created": created, "model": model,
+                                      "choices": [], "usage": {"prompt_tokens": n_prompt,
+                                                               "total_tokens": n_prompt + n,
+                                                               "completion_tokens": n}})
+                self.write_event("[DONE]")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                reason = "length"
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            finally:
+                state.end(idx, reason, n_prompt, done, time.monotonic() - t0)
+                if last:
+                    state.crash()
+
+    return Handler
+
+
+class FakeHTTPServer(http.server.ThreadingHTTPServer):
+    request_queue_size = 4096
+    daemon_threads = True
+    allow_reuse_port = False   # a second server on a taken port must fail, as uvicorn does
+
+
+def serve_main(argv: list[str]) -> int:
+    common.raise_nofile()
+    ns, _unknown = serve_parser().parse_known_args(argv)
+    cfg = ServeConfig(ns, argv)
+    log = Log()
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    if common.env_flag("FAKE_VLLM_IGNORE_SIGINT"):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    api_startup_lines(cfg, log)
+    # The real API server binds its port before building the engine and listens only once it is ready.
+    state = ServeState(cfg, log)
+    server = FakeHTTPServer(("127.0.0.1", cfg.port), make_handler(state), bind_and_activate=False)
+    try:
+        server.server_bind()
+    except OSError as e:
+        log("APIServer", "ERROR", "launcher.py:288", f"Failed to bind port {cfg.port}: {e}")
+        server.server_close()
+        return 1
+
+    if common.env_flag("FAKE_VLLM_FAIL_START"):
+        log(cfg.engine_names()[0], "INFO", "core.py:124",
+            f"Initializing a V1 LLM engine (v{VERSION}) with config: {cfg.banner()}")
+        common.fake_sleep(0.2)
+        log(cfg.engine_names()[0], "ERROR", "core.py:1366", "EngineCore failed to start.")
+        log.write(sys.stderr, f"(APIServer pid={log.api_pid}) RuntimeError: Engine core initialization failed. "
+                  "See root cause above. Failed core proc(s): {}\n")
+        server.server_close()
+        return 1
+
+    state.gpus = common.visible_gpus(cfg.tp * cfg.dp)
+    common.write_gpu_state(state.gpus, USED_MIB, os.getpid())
+    serving = None
+    try:
+        if common.env_flag("FAKE_VLLM_HANG_START"):
+            log(cfg.engine_names()[0], "INFO", "core.py:124",
+                f"Initializing a V1 LLM engine (v{VERSION}) with config: {cfg.banner()}")
+            stop.wait()
+            return 0
+        engine_startup_lines(cfg, log)
+        if stop.wait(0.5 * common.time_scale()):
+            return 0
+        server.server_activate()
+        serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        serving.start()
+        log("APIServer", "INFO", "api_server.py:139", f"Starting vLLM server on http://127.0.0.1:{cfg.port}")
+        log.uvicorn(f"Started server process [{log.api_pid}]")
+        log.uvicorn("Waiting for application startup.")
+        log.uvicorn("Application startup complete.")
+        last = time.monotonic()
+        while not stop.wait(1.0):
+            now = time.monotonic()
+            if cfg.api_servers == 1:
+                state.stats_lines(now - last)
+            last = now
+        log.uvicorn("Shutting down")
+        log.uvicorn("Waiting for application shutdown.")
+        log.uvicorn("Application shutdown complete.")
+        log.uvicorn(f"Finished server process [{log.api_pid}]")
+        return 0
+    finally:
+        if serving is not None:
+            server.shutdown()
+        server.server_close()
+        if not common.env_flag("FAKE_VLLM_LEAK_MEM"):
+            common.remove_gpu_state(state.gpus, os.getpid())
+
+
+# ================================================================ vllm bench serve
+
+
+def bench_serve_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="vllm bench serve", allow_abbrev=False)
+    p.add_argument("--backend", default="openai")
+    p.add_argument("--base-url", default=None)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--endpoint", default="/v1/completions")
+    p.add_argument("--model", default=None)
+    p.add_argument("--served-model-name", default=None)
+    p.add_argument("--tokenizer", default=None)
+    p.add_argument("--dataset-name", default="random")
+    p.add_argument("--random-input-len", type=int, default=1024)
+    p.add_argument("--random-output-len", type=int, default=128)
+    p.add_argument("--random-range-ratio", type=float, default=0.0)
+    p.add_argument("--random-prefix-len", type=int, default=0)
+    p.add_argument("--num-prompts", type=int, default=1000)
+    p.add_argument("--request-rate", type=float, default=math.inf)
+    p.add_argument("--burstiness", type=float, default=1.0)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--ignore-eos", action="store_true")
+    p.add_argument("--temperature", type=float, default=None)
+    p.add_argument("--top-p", type=float, default=None)
+    p.add_argument("--top-k", type=int, default=None)
+    p.add_argument("--num-warmups", type=int, default=0)
+    p.add_argument("--ready-check-timeout-sec", type=int, default=0)
+    p.add_argument("--save-result", action="store_true")
+    p.add_argument("--save-detailed", action="store_true")
+    p.add_argument("--result-dir", default=None)
+    p.add_argument("--result-filename", default=None)
+    p.add_argument("--percentile-metrics", default="ttft,tpot,itl")
+    p.add_argument("--metric-percentiles", default="99")
+    p.add_argument("--disable-tqdm", action="store_true")
+    p.add_argument("--request-id-prefix", default=f"bench-{uuid.uuid4().hex[:8]}-")
+    p.add_argument("--metadata", nargs="*", default=None)
+    p.add_argument("--label", default=None)
+    return p
+
+
+class RequestOutput:
+    """vllm.benchmarks.lib.endpoint_request_func.RequestFuncOutput, the fields the result JSON uses."""
+
+    def __init__(self, prompt_len: int) -> None:
+        self.prompt_len = prompt_len
+        self.output_tokens: int | None = None
+        self.generated_text = ""
+        self.success = False
+        self.latency = 0.0
+        self.ttft = 0.0
+        self.itl: list[float] = []
+        self.start_time = 0.0
+        self.client_queue_time = 0.0
+        self.error = ""
+
+
+class Endpoint:
+    def __init__(self, base_url: str) -> None:
+        u = urllib.parse.urlsplit(base_url)
+        self.host = u.hostname or "127.0.0.1"
+        self.port = u.port or 80
+
+    def call(self, method: str, path: str, body: dict | None = None, timeout: float = 30.0):
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+        try:
+            conn.request(method, path, body=None if body is None else json.dumps(body),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+
+def completion_request(ep: Endpoint, path: str, payload: dict, prompt_len: int, request_id: str | None,
+                       arrival: float | None = None) -> RequestOutput:
+    """async_request_openai_completions, synchronously: one SSE stream on its own connection."""
+    out = RequestOutput(prompt_len)
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("OPENAI_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ['OPENAI_API_KEY']}"
+    if request_id is not None:
+        headers["x-request-id"] = request_id
+    st = time.perf_counter()
+    out.start_time = st
+    out.client_queue_time = st - arrival if arrival is not None else 0.0
+    recent = st
+    conn = http.client.HTTPConnection(ep.host, ep.port, timeout=6 * 3600)
+    try:
+        conn.request("POST", path, body=json.dumps(payload), headers=headers)
+        resp = conn.getresponse()
+        if resp.status != 200:
+            resp.read()
+            out.error = resp.reason or ""
+            return out
+        first, text, buf = False, "", b""
+        while True:
+            # read1 raises IncompleteRead when the chunked body ends without its terminator (server died),
+            # like aiohttp's ClientPayloadError in the real client.
+            data = resp.read1(65536)
+            if not data:
+                break
+            buf += data
+            while b"\n\n" in buf:
+                raw, buf = buf.split(b"\n\n", 1)
+                message = raw.decode().strip()
+                if not message or message.startswith(":"):
+                    continue
+                chunk = message[len("data: "):] if message.startswith("data: ") else message
+                if chunk == "[DONE]":
+                    continue
+                event = json.loads(chunk)
+                if event.get("choices"):
+                    timestamp = time.perf_counter()
+                    if not first:
+                        first = True
+                        out.ttft = timestamp - st
+                    else:
+                        out.itl.append(timestamp - recent)
+                    recent = timestamp
+                    text += event["choices"][0].get("text") or ""
+                elif event.get("usage"):
+                    usage = event["usage"]
+                    out.output_tokens = usage.get("completion_tokens")
+                    if usage.get("prompt_tokens") is not None:
+                        out.prompt_len = usage["prompt_tokens"]
+        if first:
+            out.success = True
+        else:
+            out.error = "Never received a valid chunk to calculate TTFT.This response will be marked as failed!"
+        out.generated_text = text
+        out.latency = recent - st
+    except Exception:
+        out.success = False
+        out.error = traceback.format_exc()
+    finally:
+        conn.close()
+    return out
+
+
+def run_concurrently(jobs: list) -> list[RequestOutput]:
+    results: list = [None] * len(jobs)
+
+    def work(i, fn):
+        results[i] = fn()
+
+    threads = [threading.Thread(target=work, args=(i, fn), daemon=True) for i, fn in enumerate(jobs)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def stat_block(values: list[float], percentiles: list[float]) -> tuple[float, float, float, list[tuple]]:
+    """np.mean/median/std/percentile(values or 0) * 1000, as calculate_metrics does."""
+    xs = values or [0.0]
+    return (common.mean(xs) * 1000, common.median(xs) * 1000, common.pstdev(xs) * 1000,
+            [(p, common.percentile(xs, p) * 1000) for p in percentiles])
+
+
+def calculate_result(outputs: list[RequestOutput], duration: float, metrics: list[str],
+                     percentiles: list[float]) -> dict:
+    lens, ttfts, tpots, itls, e2els = [], [], [], [], []
+    total_input = completed = 0
+    for o in outputs:
+        if not o.success:
+            lens.append(0)
+            continue
+        n = o.output_tokens or (len(o.itl) + 1)
+        lens.append(n)
+        total_input += o.prompt_len
+        if n > 1:
+            tpots.append((o.latency - o.ttft) / (n - 1))
+        itls += o.itl
+        ttfts.append(o.ttft)
+        e2els.append(o.latency)
+        completed += 1
+
+    max_tok_s, max_conc = 0.0, 0
+    ok = [o for o in outputs if o.success]
+    if ok:
+        t0 = min(o.start_time for o in ok)
+        buckets = int(math.ceil(max(o.start_time + o.latency for o in ok) - t0)) + 1
+        tokens, conc = [0] * buckets, [0] * buckets
+        for o in ok:
+            t = o.start_time + o.ttft
+            times = [t]
+            for gap in o.itl:
+                t += gap
+                times.append(t)
+            for tt in times:
+                b = int(tt - t0)
+                if 0 <= b < buckets:
+                    tokens[b] += 1
+            for b in range(int(o.start_time - t0), int(o.start_time + o.latency - t0) + 1):
+                conc[b] += 1
+        max_tok_s, max_conc = float(max(tokens)), int(max(conc))
+
+    total_output = sum(lens)
+    result = {
+        "duration": duration,
+        "completed": completed,
+        "failed": len(outputs) - completed,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "request_throughput": completed / duration,
+        "request_goodput": None,
+        "output_throughput": total_output / duration,
+        "total_token_throughput": (total_input + total_output) / duration,
+        "input_lens": [o.prompt_len for o in outputs],
+        "output_lens": lens,
+        "ttfts": [o.ttft for o in outputs],
+        "itls": [o.itl for o in outputs],
+        "latencies": [o.latency for o in outputs],
+        "start_times": [o.start_time for o in outputs],
+        "queue_times": [o.client_queue_time for o in outputs],
+        "generated_texts": [o.generated_text for o in outputs],
+        "errors": [o.error for o in outputs],
+        "max_output_tokens_per_s": max_tok_s,
+        "max_concurrent_requests": max_conc,
+        "rtfx": 0.0,
+    }
+    for name, values in (("ttft", ttfts), ("tpot", tpots), ("itl", itls), ("e2el", e2els)):
+        if name not in metrics:
+            continue
+        mean, median, std, pcts = stat_block(values, percentiles)
+        result[f"mean_{name}_ms"] = mean
+        result[f"median_{name}_ms"] = median
+        result[f"std_{name}_ms"] = std
+        for p, value in pcts:
+            p_word = str(int(p)) if int(p) == p else str(p)
+            result[f"p{p_word}_{name}_ms"] = value
+    return result
+
+
+def bench_serve_main(argv: list[str]) -> int:
+    common.raise_nofile()
+    args = bench_serve_parser().parse_args(argv)
+    base_url = args.base_url or f"http://{args.host}:{args.port}"
+    ep = Endpoint(base_url)
+    path = urllib.parse.urlsplit(base_url).path.rstrip("/") + args.endpoint
+    if not args.endpoint.endswith(("completions", "profile")):
+        raise ValueError("OpenAI Completions API URL must end with 'completions' or 'profile'.")
+
+    if args.model is None:
+        print("Model not specified, fetching first model from server...")
+        _, raw = ep.call("GET", "/v1/models")
+        card = json.loads(raw)["data"][0]
+        model_name, model_id = card["id"], card["root"]
+        print(f"First model name: {model_name}, first model id: {model_id}")
+    else:
+        model_name, model_id = args.served_model_name, args.model
+    tokenizer_id = args.tokenizer if args.tokenizer is not None else model_id
+
+    rng = random.Random(args.seed)
+    real_in = max(0, args.random_input_len - 1)          # the random dataset subtracts BOS (D4-15)
+    in_lo = math.floor(real_in * (1 - args.random_range_ratio))
+    in_hi = math.ceil(real_in * (1 + args.random_range_ratio))
+    out_lo = math.floor(args.random_output_len * (1 - args.random_range_ratio))
+    out_hi = math.ceil(args.random_output_len * (1 + args.random_range_ratio))
+    print(f"INFO {time.strftime('%m-%d %H:%M:%S')} [utils.py:90] Sampling input_len from [{in_lo}, {in_hi}] "
+          f"and output_len from [{out_lo}, {out_hi}]")
+    requests = []
+    for _ in range(args.num_prompts):
+        n_in = args.random_prefix_len + rng.randint(in_lo, in_hi)
+        requests.append(("a " * n_in, n_in, rng.randint(out_lo, out_hi)))
+
+    sampling = {k: v for k, v in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k))
+                if v is not None}
+    if args.temperature is None:
+        print("WARNING: vllm bench serve no longer sets temperature==0 (greedy) in requests by default. The "
+              "default will be determined on the server side and can be model/API specific. For the old "
+              "behavior, include --temperature=0.")
+
+    def payload(prompt: str, out_len: int) -> dict:
+        body = {"model": model_name or model_id, "prompt": prompt, "repetition_penalty": 1.0,
+                "max_tokens": out_len, "logprobs": None, "stream": True, "stream_options": {"include_usage": True}}
+        if args.ignore_eos:
+            body["ignore_eos"] = True
+        body.update(sampling)
+        return body
+
+    if args.dataset_name in ("random", "prefix_repetition"):
+        try:
+            status, _ = ep.call("POST", "/tokenize", {"model": model_name or model_id, "prompt": requests[0][0],
+                                                      "add_special_tokens": False})
+        except OSError:
+            status = 0
+        if status != 200:
+            print("WARNING: /tokenize unavailable, skipping alignment.")
+
+    first_prompt, first_len, first_out = requests[0]
+    if args.ready_check_timeout_sec > 0:
+        print("Starting initial single prompt test run...")
+        deadline = time.monotonic() + args.ready_check_timeout_sec
+        while True:
+            test = completion_request(ep, path, payload(first_prompt, first_out), first_len, None)
+            if test.success:
+                break
+            if time.monotonic() >= deadline:
+                raise ValueError("Initial test run failed - Please make sure benchmark arguments are correctly "
+                                 f"specified. Error: {test.error}")
+            common.fake_sleep(5)
+        print("Initial test run completed.")
+    else:
+        print("Skipping endpoint ready check.")
+    if args.num_warmups > 0:
+        print(f"Warming up with {args.num_warmups} requests...")
+        run_concurrently([lambda: completion_request(ep, path, payload(first_prompt, first_out), first_len, None)
+                          for _ in range(args.num_warmups)])
+        print("Warmup run completed.")
+
+    def scrape() -> None:
+        try:
+            ep.call("GET", "/metrics")
+        except OSError:
+            pass
+
+    scrape()
+    scrape()
+    rate = args.request_rate
+    print(f"Traffic request rate: {rate}")
+    print(f"Burstiness factor: {args.burstiness} ({'Poisson process' if args.burstiness == 1.0 else 'Gamma'})")
+    print("Maximum request concurrency: None")
+
+    arrivals = random.Random(args.seed)
+    results: list = [None] * len(requests)
+    threads = []
+    bench_start = time.perf_counter()
+    target = bench_start
+
+    def work(i: int, arrival: float) -> None:
+        prompt, n_in, out_len = requests[i]
+        results[i] = completion_request(ep, path, payload(prompt, out_len), n_in, f"{args.request_id_prefix}{i}",
+                                        arrival)
+
+    for i in range(len(requests)):
+        if i and rate != math.inf:
+            theta = 1.0 / (rate * args.burstiness)
+            target += arrivals.gammavariate(args.burstiness, theta) * common.time_scale()
+            delay = target - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+        t = threading.Thread(target=work, args=(i, time.perf_counter()), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    duration = time.perf_counter() - bench_start
+    scrape()
+    scrape()
+
+    metrics = [m.strip() for m in args.percentile_metrics.split(",")]
+    percentiles = [float(p) for p in args.metric_percentiles.split(",")]
+    bench = calculate_result(results, duration, metrics, percentiles)
+    failed = [o for o in results if not o.success]
+    if failed:
+        print("Failed requests during benchmark run detected (capping to 10):")
+        for i, o in enumerate(failed[:10]):
+            print(f"Error {i}: {o.error}")
+    print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
+    print("{:<40} {:<10}".format("Successful requests:", bench["completed"]))
+    print("{:<40} {:<10}".format("Failed requests:", bench["failed"]))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", duration))
+    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", bench["request_throughput"]))
+    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", bench["output_throughput"]))
+    print("=" * 50)
+
+    current_dt = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    result = {"date": current_dt, "endpoint_type": args.backend, "backend": args.backend, "label": args.label,
+              "model_id": model_id, "tokenizer_id": tokenizer_id, "num_prompts": args.num_prompts}
+    for item in args.metadata or []:
+        if "=" not in item:
+            raise ValueError("Invalid metadata format. Please use KEY=VALUE format.")
+        key, value = item.split("=", 1)
+        result[key.strip()] = value.strip()
+    result["request_rate"] = rate if rate < math.inf else "inf"
+    result["burstiness"] = args.burstiness
+    result["max_concurrency"] = None
+    result = {**result, **bench}
+    if not args.save_detailed:
+        for field in ("input_lens", "output_lens", "start_times", "ttfts", "itls", "generated_texts", "errors"):
+            result.pop(field, None)
+    if args.save_result:
+        name = args.result_filename or (f"{args.label or args.backend}-{rate}qps-{model_id.split('/')[-1]}-"
+                                        f"{current_dt}.json")
+        if args.result_dir:
+            os.makedirs(args.result_dir, exist_ok=True)
+            name = os.path.join(args.result_dir, name)
+        with open(name, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+    return 0
+
+
+# ================================================================ vllm bench latency
+
+
+def bench_latency_main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="vllm bench latency", allow_abbrev=False)
+    p.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    p.add_argument("--input-len", type=int, default=32)
+    p.add_argument("--output-len", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--n", type=int, default=1)
+    p.add_argument("--num-iters-warmup", type=int, default=10)
+    p.add_argument("--num-iters", type=int, default=30)
+    p.add_argument("--output-json", default=None)
+    p.add_argument("--profile", action="store_true")
+    p.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+    args, _engine_args = p.parse_known_args(argv)
+    per_iter = (0.005 + 1e-5 * args.batch_size) * args.output_len / args.tensor_parallel_size
+
+    def run_once() -> float:
+        start = time.perf_counter()
+        common.fake_sleep(per_iter)
+        return time.perf_counter() - start
+
+    print("Warming up...")
+    for _ in range(args.num_iters_warmup):
+        run_once()
+    if args.profile:
+        print("Profiling with cuda profiler ...")
+        run_once()
+        return 0
+    latencies = [run_once() for _ in range(args.num_iters)]
+    percentages = [10, 25, 50, 75, 90, 99]
+    values = [common.percentile(latencies, q) for q in percentages]
+    avg = common.mean(latencies)
+    print(f"Avg latency: {avg} seconds")
+    for q, v in zip(percentages, values):
+        print(f"{q}% percentile latency: {v} seconds")
+    if args.output_json:
+        with open(args.output_json, "w") as f:
+            json.dump({"avg_latency": avg, "latencies": latencies,
+                       "percentiles": {str(q): v for q, v in zip(percentages, values)}}, f, indent=4)
+    return 0
+
+
+# ================================================================ entry point
+
+
+def main(argv: list[str]) -> int:
+    if argv in (["--version"], ["-v"]):
+        print(VERSION)
+        return 0
+    for prefix, fixture in HELP_FIXTURES.items():
+        if tuple(argv[:len(prefix)]) != prefix:
+            continue
+        rest = argv[len(prefix):]
+        if "--help=all" in rest or "--help" in rest or "-h" in rest:
+            text = (common.FIXTURES / fixture).read_text()
+            if "--help=all" not in rest:
+                text = "".join(text.splitlines(keepends=True)[:PLAIN_HELP_LINES])
+            sys.stdout.write(text)
+            return 0
+        if prefix == ("serve",):
+            return serve_main(rest)
+        if prefix == ("bench", "serve"):
+            return bench_serve_main(rest)
+        return bench_latency_main(rest)
+    sys.stderr.write("usage: vllm [-h] [-v] {chat,complete,serve,bench,collect-env,run-batch} ...\n"
+                     f"fake vllm: unsupported command: {' '.join(argv)}\n")
+    return 2
+
+
+if __name__ == "__main__":
+    code = main(sys.argv[1:])
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

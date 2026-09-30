@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Fake torchrun: runs tpprof's comm benchmarks once, in --synthetic mode, as rank 0 of N.
+
+  torchrun --nproc-per-node N [--master-port P] -m tpprof.comm_bench ARGS  -> python -m tpprof.comm_bench --synthetic ARGS
+  torchrun --nproc-per-node N [--master-port P] -m tpprof.vendored m1|m2 ARGS -> python -m tpprof.vendored m1|m2 ARGS --synthetic
+
+Anything else exits 2. The child runs under this interpreter (sys.executable), like the real torchrun.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="torchrun", allow_abbrev=False)
+    parser.add_argument("--nproc-per-node", "--nproc_per_node", dest="nproc", type=int, default=1)
+    parser.add_argument("--master-port", "--master_port", dest="master_port", type=int, default=29500)
+    parser.add_argument("--master-addr", "--master_addr", dest="master_addr", default="127.0.0.1")
+    parser.add_argument("--nnodes", default="1")
+    parser.add_argument("--standalone", action="store_true")
+    parser.add_argument("-m", "--module", dest="module", action="store_true")
+    parser.add_argument("target")
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    ns = parser.parse_args(argv)
+
+    if ns.module and ns.target == "tpprof.comm_bench":
+        cmd = [sys.executable, "-m", ns.target, "--synthetic", *ns.args]
+    elif ns.module and ns.target == "tpprof.vendored" and ns.args[:1] in (["m1"], ["m2"]):
+        cmd = [sys.executable, "-m", ns.target, *ns.args, "--synthetic"]
+    else:
+        what = ("-m " if ns.module else "") + " ".join([ns.target, *ns.args])
+        sys.stderr.write(f"fake torchrun: unsupported target: {what}\n"
+                         "supported: -m tpprof.comm_bench ..., -m tpprof.vendored m1|m2 ...\n")
+        return 2
+
+    env = dict(os.environ, RANK="0", LOCAL_RANK="0", WORLD_SIZE=str(ns.nproc), LOCAL_WORLD_SIZE=str(ns.nproc),
+               MASTER_ADDR=ns.master_addr, MASTER_PORT=str(ns.master_port))
+    return subprocess.call(cmd, env=env)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
