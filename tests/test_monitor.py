@@ -19,11 +19,14 @@ C8_MONITOR_QUERY = ("--query-gpu=timestamp,index,clocks.sm,clocks.mem,power.draw
 
 
 def _fake_monitor_smi(tmp_path: pathlib.Path, argv_out: pathlib.Path) -> str:
-    """nvidia-smi that records its argv, then prints two GPU rows per 50 ms tick until killed."""
+    """nvidia-smi that records its argv, then prints two GPU rows per 50 ms tick until killed.
+
+    FAKE_SMI_START_DELAY_S delays the start, like a slow interpreter start on a loaded machine."""
     script = tmp_path / "nvidia-smi"
     script.write_text(textwrap.dedent(f"""\
         #!{PY}
         import os, sys, time
+        time.sleep(float(os.environ.get("FAKE_SMI_START_DELAY_S", "0")))
         open({str(argv_out)!r}, "w").write("\\n".join(sys.argv[1:]) + "\\n" + os.environ.get("TPPROF_RUN_ID", ""))
         while True:
             for i in (0, 1):
@@ -38,12 +41,16 @@ def _rows(path: pathlib.Path) -> list[str]:
     return [ln for ln in path.read_text().splitlines() if ln.startswith("2026/")]
 
 
-def test_gpu_monitor_writes_rows_and_stops(tmp_path):
+@pytest.mark.parametrize("start_delay_s", ["0", "0.7"])
+def test_gpu_monitor_writes_rows_and_stops(tmp_path, monkeypatch, start_delay_s):
+    monkeypatch.setenv("FAKE_SMI_START_DELAY_S", start_delay_s)
     argv_out = tmp_path / "argv"
     smi = _fake_monitor_smi(tmp_path, argv_out)
     csv_path = tmp_path / "gpu.csv"
     with monitor.GpuMonitor(str(csv_path), "run-mon", nvidia_smi=smi) as mon:
-        time.sleep(0.5)
+        deadline = time.monotonic() + 10       # wait for rows, not a fixed time: the fake may start late
+        while len(_rows(csv_path)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
         pid = mon.proc.popen.pid
     assert len(_rows(csv_path)) >= 2
     assert argv_out.read_text().splitlines() == [
