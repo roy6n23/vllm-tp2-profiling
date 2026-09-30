@@ -5,7 +5,6 @@ import http.server
 import importlib.util
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -227,6 +226,20 @@ def test_box_scripts_pass_bash_syntax_check(name):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_bootstrap_runs_the_briefs_python_commands_in_order():
+    text = (SCRIPTS / "bootstrap_box.sh").read_text()
+    lines = [line.strip() for line in text.splitlines()]
+    # Brief steps 2, 4 and 8, and AM27, write `python -m tpprof ...`; no python3 or $PY indirection.
+    quick = next(i for i, line in enumerate(lines) if "python -m tpprof preflight --quick" in line)
+    pip = lines.index('python -m pip install --no-deps -e "$REPO"')
+    full = lines.index("python -m tpprof preflight")
+    assert quick < pip < full
+    assert "python3 -m" not in text and "$PY" not in text
+    # The image has only python3, so step 1 links `python` to it before the first Python step.
+    link = lines.index('ln -sf "$py3" /usr/local/bin/python')
+    assert lines.index("source /etc/profile.d/00-image-env.sh") < link < quick
+
+
 def _fake_rsync_env(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -254,38 +267,11 @@ def test_sync_to_box_rsyncs_repo_with_brief_argv(tmp_path):
     assert proc.returncode == 0, proc.stderr
     (call,) = _rsync_calls(log)
     assert os.path.realpath(call["cwd"]) == os.path.realpath(ROOT)
-    argv = call["argv"]
-    assert argv[:7] == ["-az", "--delete", "--exclude", ".venv", "--exclude", "results/dryrun", "-e"]
-    assert argv[7] == "ssh -p 10341"
-    assert argv[-2:] == ["./", "root@203.0.113.7:/workspace/vllm-tp2-profiling/"]
-    # A re-sync must never delete run records the box has produced under results/.
-    i = argv.index("--filter")
-    assert argv[i + 1] == "protect /results/***"
+    # Exactly the brief's command, no extra options.
+    assert call["argv"] == ["-az", "--delete", "--exclude", ".venv", "--exclude", "results/dryrun",
+                            "-e", "ssh -p 10341", "./", "root@203.0.113.7:/workspace/vllm-tp2-profiling/"]
     assert "Liger" in proc.stdout
-
-
-@pytest.mark.skipif(shutil.which("rsync") is None, reason="needs a real rsync")
-def test_sync_to_box_filters_keep_box_results_on_resync(tmp_path):
-    # Replay the script's rsync argv with a real rsync into a local "box" directory. The source has a
-    # results/ directory holding only the excluded results/dryrun, which is the case where an anchored
-    # "/results/" protect rule lets GNU rsync delete the box's run records.
-    env, _home, log = _fake_rsync_env(tmp_path)
-    proc = subprocess.run(["bash", str(SCRIPTS / "sync_to_box.sh"), "203.0.113.7", "10341"],
-                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
-    assert proc.returncode == 0, proc.stderr
-    argv = _rsync_calls(log)[0]["argv"]
-    e = argv.index("-e")
-    options = argv[:e] + argv[e + 2:-2]
-    src, box = tmp_path / "src", tmp_path / "box"
-    for rel, text in [("tpprof/m.py", "new"), ("results/dryrun/x.json", "dry"), (".venv/pyvenv.cfg", "v")]:
-        (src / rel).parent.mkdir(parents=True, exist_ok=True)
-        (src / rel).write_text(text)
-    for rel in ["results/raw/r1/done.json", "results/p0.log", "stale.txt"]:
-        (box / rel).parent.mkdir(parents=True, exist_ok=True)
-        (box / rel).write_text("box")
-    subprocess.run(["rsync", *options, "./", f"{box}/"], cwd=src, check=True, capture_output=True, timeout=60)
-    kept = sorted(str(q.relative_to(box)) for q in box.rglob("*") if q.is_file())
-    assert kept == ["results/p0.log", "results/raw/r1/done.json", "tpprof/m.py"]
+    assert "pull results/ back first" in proc.stdout
 
 
 def test_sync_to_box_also_copies_triton_fa2_forward_when_present(tmp_path):

@@ -11,10 +11,6 @@ ENV_FILE=/workspace/tpprof.env
 NCCL_SCRIPT=/workspace/nccl-tests.sh
 NCCL_LOG=/workspace/nccl-tests-build.log
 NCCL_PID=/workspace/nccl-tests-build.pid
-# The brief and AM27 write `python -m tpprof ...`, but the vLLM image has no `python` command: its runtime
-# stage links only /usr/bin/python3 (vLLM v0.30.0 docker/Dockerfile:786-788, base nvidia/cuda ubuntu).
-# So every Python step here runs "$PY", python3 unless PY is set.
-PY=${PY:-python3}
 
 step() { printf '\n==> [%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { printf 'bootstrap_box.sh: %s\n' "$*" >&2; exit 1; }
@@ -24,11 +20,19 @@ step "1/9 image environment"
 [ -r /etc/profile.d/00-image-env.sh ] || die "/etc/profile.d/00-image-env.sh is missing; was the pod created by scripts/runpod.py create?"
 # shellcheck disable=SC1091
 source /etc/profile.d/00-image-env.sh
+# Every Python step runs `python`, as the brief and AM27 write it. The vLLM image links only
+# /usr/bin/python3 (vLLM v0.30.0 docker/Dockerfile:786-788) and has no `python` command, so point one at
+# python3 once. No download; a rerun finds it already there.
+if ! command -v python >/dev/null 2>&1; then
+    py3=$(command -v python3) || die "neither python nor python3 is on PATH"
+    ln -sf "$py3" /usr/local/bin/python
+    echo "linked /usr/local/bin/python -> $py3"
+fi
 cd "$REPO"
 
 # Pinned values come from tpprof/constants.py only (importable from the repo dir before any install).
 # Assigned before eval so that a failing import aborts the script under set -e.
-pinned=$("$PY" - <<'EOF'
+pinned=$(python - <<'EOF'
 import shlex
 from tpprof import constants as c
 for name, value in (("NSYS_PKG", c.NSYS_APT_PACKAGE), ("NSYS_VERSION", c.NSYS_VERSION),
@@ -40,7 +44,7 @@ eval "$pinned"
 
 # 2. Quick hardware gates before any download (AM27).
 step "2/9 quick preflight"
-if ! "$PY" -m tpprof preflight --quick; then
+if ! python -m tpprof preflight --quick; then
     echo "Quick preflight failed: this box is not usable. On your Mac run: python3 scripts/runpod.py terminate <POD_ID>" >&2
     echo "Then create a new pod and retry." >&2
     exit 1
@@ -72,7 +76,7 @@ esac
 
 # 4. tpprof into the image Python, keeping the image's numpy/psutil and NCCL pin (AM30).
 step "4/9 pip install --no-deps -e $REPO"
-"$PY" -m pip install --no-deps -e "$REPO"
+python -m pip install --no-deps -e "$REPO"
 
 # 5. Model weights on the volume disk; hf skips files that are already complete.
 step "5/9 model $MODEL_REPO@$MODEL_REV"
@@ -86,7 +90,7 @@ step "6/9 nccl-tests build (background)"
 if [ -f "$NCCL_PID" ] && kill -0 "$(cat "$NCCL_PID")" 2>/dev/null; then
     echo "already running: pid $(cat "$NCCL_PID"), log $NCCL_LOG"
 else
-    "$PY" -c 'from tpprof.nccltests import build_script; print(build_script())' > "$NCCL_SCRIPT"
+    python -c 'from tpprof.nccltests import build_script; print(build_script())' > "$NCCL_SCRIPT"
     nohup bash "$NCCL_SCRIPT" > "$NCCL_LOG" 2>&1 &
     echo $! > "$NCCL_PID"
     echo "started: pid $!, log $NCCL_LOG"
@@ -105,8 +109,8 @@ source "$ENV_FILE"
 
 # 8. Full preflight: versions, flags, model files, nsys, imports.
 step "8/9 full preflight"
-"$PY" -m tpprof preflight
+python -m tpprof preflight
 
 step "9/9 done"
-echo "next: source $ENV_FILE && cd $REPO && $PY -m tpprof matrix --estimate"
-echo "then: $PY -m tpprof run --tier P0 2>&1 | tee results/p0.log"
+echo "next: source $ENV_FILE && cd $REPO && python -m tpprof matrix --estimate"
+echo "then: python -m tpprof run --tier P0 2>&1 | tee results/p0.log"

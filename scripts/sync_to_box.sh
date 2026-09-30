@@ -12,17 +12,10 @@ PORT=$2
 
 cd "$(dirname "$0")/.."
 
-# The rsync command is the brief's, plus one protect rule. --delete keeps the box copy identical to this
-# checkout, but the box's results/ holds the run records of paid GPU time, which this checkout may lack.
-# The receiver (the box) decides each deletion by matching the extraneous path against the filters.
-# "/results/***" matches the results directory and every path below it, so nothing under results/ is
-# ever deleted. "/results/" alone matches only the directory entry: whenever this checkout has a
-# results/ directory (even one holding only the excluded results/dryrun), GNU rsync recurses into it
-# and deletes the box's results/raw/... files. Checked with Mac openrsync -> GNU rsync 3.5.0.
-# Protect only stops deletion: files that also exist here are still sent and overwrite the box copy.
-rsync -az --delete --exclude .venv --exclude results/dryrun -e "ssh -p $PORT" \
-    --filter "protect /results/***" \
-    ./ "root@$HOST:/workspace/vllm-tp2-profiling/"
+# The brief's rsync command, unchanged. --delete makes the box copy identical to this checkout, so any
+# box file that is missing here is deleted, including run records under the box's results/ that were not
+# pulled back yet. Pull results/ back from the box before re-syncing during a rental.
+rsync -az --delete --exclude .venv --exclude results/dryrun -e "ssh -p $PORT" ./ "root@$HOST:/workspace/vllm-tp2-profiling/"
 echo "synced $(pwd) -> root@$HOST:/workspace/vllm-tp2-profiling/"
 
 FA2="$HOME/Documents/Personal/triton-fa2-forward"
@@ -35,4 +28,5 @@ fi
 
 echo "Liger: this script does not copy Liger-Kernel. Its optimization/ directory is git-excluded and lives on"
 echo "the other machine; copy it to the box separately before the Liger block."
+echo "Re-sync: --delete removes box files missing here, including results/; pull results/ back first."
 echo "next: ssh -p $PORT root@$HOST, then: tmux new -s tp2, then: bash /workspace/vllm-tp2-profiling/scripts/bootstrap_box.sh"
