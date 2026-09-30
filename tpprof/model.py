@@ -350,7 +350,7 @@ def _sig4(x: float) -> float:
 
 def _band(values: list[float | None]) -> list[float] | None:
     kept = [v for v in values if v is not None]
-    return [_sig4(min(kept)), _sig4(max(kept))] if kept else None
+    return [min(kept), max(kept)] if kept else None
 
 
 def _decode_speedup(batch: int, c: Constants) -> float:
@@ -365,7 +365,17 @@ def _dp2_over_tp2_saturation(c: Constants) -> float:
     return saturation_output_tps("DP2", c) / saturation_output_tps("TP2", c)
 
 
-def _hypothesis_values(c: Constants) -> dict[str, float | None]:
+def hypothesis_values(c: Constants) -> dict[str, float | None]:
+    """The value of every hypothesis quantity (HYPOTHESIS_IDS) under constant set `c`, rounded to
+    4 significant digits after all arithmetic; H4 (s*, ms) may be None.
+
+    predictions()["bands"] is the min/max of these over the band sets; predict.py calls this with
+    the central constants for the hypotheses table's "central" column. Rounding is monotone, so
+    the min/max of rounded values equals the rounded min/max."""
+    return {h: None if v is None else _sig4(v) for h, v in _raw_hypothesis_values(c).items()}
+
+
+def _raw_hypothesis_values(c: Constants) -> dict[str, float | None]:
     b_min, b_max = min(DECODE_BATCHES), max(DECODE_BATCHES)
     n_min, n_max = min(PREFILL_LENS), max(PREFILL_LENS)
     return {
@@ -390,13 +400,14 @@ def predictions() -> dict:
     Keys beyond the brief's schema, needed by predictions.md and T17:
     - bands["H2_prefill"]: the prefill leg of H2 (spec 4.8, AM24), e(max prefill len) - e(min prefill len);
       bands["H2"] stays the decode leg, e(128) - e(1).
-    - hypotheses_central: the central-set value of every band (H8 is not derivable from other keys).
     - ratios: TP1/TP2 decode and prefill speedups and the DP2/TP2 saturation ratio per set, taken
       before rounding so the tables agree with the hypothesis values.
-    Bands are the min/max over the optimistic, central and pessimistic sets (not d8)."""
+    Bands are the min/max over the optimistic, central and pessimistic sets (not d8). The central
+    value of each hypothesis is not stored: predict.py derives it from ``constants["central"]``
+    with hypothesis_values()."""
     names = list(CONSTANTS)
     s_stars = {n: s_star(CONSTANTS[n]) for n in names}
-    hyp = {n: _hypothesis_values(CONSTANTS[n]) for n in _BAND_SETS}
+    hyp = {n: hypothesis_values(CONSTANTS[n]) for n in _BAND_SETS}
     kv = {n: (kv_capacity_tokens(1, CONSTANTS[n]), kv_capacity_tokens(2, CONSTANTS[n])) for n in names}
     return {
         "constants": {n: asdict(c) for n, c in CONSTANTS.items()},
@@ -409,7 +420,6 @@ def predictions() -> dict:
                            for n in names},
         "s_star_ms": {n: None if v is None else _sig4(v) for n, v in s_stars.items()},
         "bands": {h: _band([hyp[n][h] for n in _BAND_SETS]) for h in HYPOTHESIS_IDS},
-        "hypotheses_central": {h: None if v is None else _sig4(v) for h, v in hyp["central"].items()},
         "ratios": {
             "decode_speedup": {n: {str(b): _sig4(_decode_speedup(b, CONSTANTS[n])) for b in DECODE_BATCHES}
                                for n in names},

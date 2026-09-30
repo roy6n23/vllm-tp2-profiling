@@ -140,21 +140,44 @@ def test_predictions_h2_has_a_prefill_leg():
 
     lo, hi = p["bands"]["H2_prefill"]
     assert lo <= hi
-    assert p["hypotheses_central"]["H2_prefill"] == pytest.approx(e(8192) - e(512), rel=1e-3)
-    assert lo <= p["hypotheses_central"]["H2_prefill"] <= hi
+    central = m.hypothesis_values(c)["H2_prefill"]
+    assert central == pytest.approx(e(8192) - e(512), rel=1e-3)
+    assert lo <= central <= hi
 
 
-def test_predictions_central_values_lie_in_their_bands():
+BRIEF_KEYS = {"constants", "decode", "prefill", "kv", "saturation_tps", "s_star_ms", "bands"}
+
+
+def test_predictions_keys_are_the_brief_schema_plus_ratios_only():
+    # The brief's schema, plus the documented "ratios" extension; no "hypotheses_central".
+    assert set(m.predictions()) == BRIEF_KEYS | {"ratios"}
+
+
+def test_hypothesis_values_are_rounded_and_lie_in_their_bands():
     p = m.predictions()
-    assert set(p["hypotheses_central"]) == set(p["bands"])
-    for h, (lo, hi) in p["bands"].items():
-        assert lo <= p["hypotheses_central"][h] <= hi, h
+    for name in ("optimistic", "central", "pessimistic"):
+        values = m.hypothesis_values(m.CONSTANTS[name])
+        assert set(values) == set(p["bands"])
+        for h, (lo, hi) in p["bands"].items():
+            assert float(f"{values[h]:.4g}") == values[h], (name, h)
+            assert lo <= values[h] <= hi, (name, h)
+    # The bands are exactly the min/max of the per-set values.
+    per_set = [m.hypothesis_values(m.CONSTANTS[n]) for n in ("optimistic", "central", "pessimistic")]
+    for h, band in p["bands"].items():
+        assert band == [min(v[h] for v in per_set), max(v[h] for v in per_set)], h
+
+
+def test_hypothesis_values_h8_is_the_nccl_unfused_over_fused_ratio():
+    c = m.CONSTANTS["central"]
+    full = m.decode_step_time(2, 1, 1216, c, ar_path="nccl_unfused") / m.decode_step_time(2, 1, 1216, c)
+    assert m.hypothesis_values(c)["H8"] == float(f"{full:.4g}")
 
 
 def test_predictions_ratios_are_computed_before_rounding():
     p, c = m.predictions(), m.CONSTANTS["central"]
     full = m.decode_step_time(1, 1, 1216, c) / m.decode_step_time(2, 1, 1216, c)
     assert p["ratios"]["decode_speedup"]["central"]["1"] == float(f"{full:.4g}")
-    assert p["ratios"]["decode_speedup"]["central"]["1"] == p["hypotheses_central"]["H1"]
-    assert p["ratios"]["dp2_over_tp2_saturation"]["central"] == p["hypotheses_central"]["H3"]
+    central = m.hypothesis_values(c)
+    assert p["ratios"]["decode_speedup"]["central"]["1"] == central["H1"]
+    assert p["ratios"]["dp2_over_tp2_saturation"]["central"] == central["H3"]
     assert set(p["ratios"]["prefill_speedup"]["central"]) == set(p["prefill"]["central"]["1"])

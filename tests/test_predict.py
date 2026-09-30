@@ -28,3 +28,29 @@ def test_ms_format_never_shows_more_than_4_significant_digits():
 def test_hypotheses_table_has_the_h2_prefill_leg():
     md = predict.render_predictions_md(model.predictions())
     assert "| H2 (prefill) |" in md
+
+
+def _hypothesis_rows(md: str) -> dict[str, list[str]]:
+    section = md.split("## Hypotheses")[1].split("\n## ")[0]
+    rows = [line.strip("|").split(" | ") for line in section.splitlines() if line.startswith("| H")]
+    return {r[0].strip(): [c.strip() for c in r] for r in rows}
+
+
+def test_hypotheses_central_column_comes_from_the_central_constants():
+    pred = model.predictions()
+    assert "hypotheses_central" not in pred
+    rows = _hypothesis_rows(predict.render_predictions_md(pred))
+    central = model.hypothesis_values(model.CONSTANTS["central"])
+    for label, key, _, kind in predict.HYPOTHESES:
+        assert rows[label][3] == predict._hyp_value(central[key], kind), label
+    assert rows["H8"][3] == "1.060"
+
+
+def test_hypotheses_central_column_follows_the_constants_in_pred():
+    # The renderer reads the central constants from pred itself, not from module state.
+    pred = model.predictions()
+    pred["constants"]["central"] = dict(pred["constants"]["central"], unfused_norm_s=0.0)
+    rows = _hypothesis_rows(predict.render_predictions_md(pred))
+    c = model.Constants(**pred["constants"]["central"])
+    assert rows["H8"][3] == predict._hyp_value(model.hypothesis_values(c)["H8"], "ratio")
+    assert rows["H8"][3] != "1.060"

@@ -77,11 +77,12 @@ def render_predictions_md(pred: dict) -> str:
         "## Hypotheses",
         "",
     ]
+    central = model.hypothesis_values(model.Constants(**pred["constants"]["central"]))
     rows = []
     for label, key, statement, kind in HYPOTHESES:
         band = pred["bands"][key]
         band_s = "none" if band is None else f"{_hyp_value(band[0], kind)}–{_hyp_value(band[1], kind)}"
-        rows.append([label, statement, band_s, _hyp_value(pred["hypotheses_central"][key], kind)])
+        rows.append([label, statement, band_s, _hyp_value(central[key], kind)])
     lines += [*_table(["id", "statement", "band (lo–hi)", "central"], rows), ""]
 
     lines += ["## Decode step time (ms, context 1216)", "",
