@@ -31,6 +31,7 @@ from tpprof.constants import (
     ONLINE_OUTPUT_LEN,
     PREFILL_LENS,
     ROUNDS,
+    SAT_SEEDS,
     TPOT_SLOS_MS,
     TTFT_SLO_S,
     TTFT_SLO_SENSITIVITY_S,
@@ -38,7 +39,7 @@ from tpprof.constants import (
 )
 
 TABLES = ("offline_points", "online_runs", "saturation", "goodput", "s_star", "comm", "kv_capacity",
-          "trace_summary")
+          "trace_summary", "trace_steps")
 # Also written to tidy/: the H2 bootstrap, the spec section 6 evidence table and the gap list.
 EXTRA_TABLES = ("efficiency_delta", "confounders", "gaps")
 ALL_TABLES = TABLES + EXTRA_TABLES
@@ -50,6 +51,9 @@ GPU_ASYM_FLAG = 0.01         # AM14: GPU0/GPU1 decode difference that flags the 
 XCHECK_TOL = 0.03            # spec 4.3: bench latency vs the offline driver
 H6_MIN_EXACT = 0.99          # spec 4.8: exact 65 AR / 1 AG in >= 99% of steps
 H7_BASE_MAX, H7_G2_MIN = 0.10, 0.30
+# AM16: vLLM's standalone residual-add + RMSNorm kernel (vllm::fused_add_rms_norm_kernel, kernel_names.tsv).
+FUSED_ADD_RMS_NORM = re.compile(r"fused_add_rms_norm")
+UNFUSED_AR_ARMS = ("AR1", "AR2", "AR3")      # spec 4.7: the RMSNorm is not fused into the all-reduce
 N_BOOT = 2000
 S_STAR_BOOT = 500
 MAX_EVIDENCE_PATHS = 3
@@ -414,37 +418,123 @@ def _is_client(cmd: str) -> bool:
     return bool(re.search(r"\bbench serve\b", cmd))
 
 
-def cpu_p90(path: str) -> dict[str, float | None]:
-    """p90 of cpu_percent per process of a CpuSampler csv; the max over pids per role (api / client)."""
+def cpu_p90(path: str, window: tuple[float, float] | None = None) -> dict:
+    """p90 of cpu_percent per process of a CpuSampler csv; the max over pids per role (api / client).
+
+    With `window` = (t_wall_start, t_wall_end), only the samples inside it count (AM11: one value per client
+    run). A row whose t_wall or cpu_percent does not parse, such as the truncated last line of a sampler that
+    was killed mid-write, is skipped and counted in "bad_rows"; "samples" counts the rows that were used."""
     by_pid: dict[tuple[str, str], list[float]] = {}
-    with open(path, newline="") as fh:
+    bad = used = 0
+    with open(path, newline="", errors="replace") as fh:
         for row in csv.DictReader(fh):
             cmd = row.get("cmd") or ""
             role = "client" if _is_client(cmd) else "api" if _is_api_server(cmd) else None
-            if role is not None:
-                by_pid.setdefault((role, row["pid"]), []).append(float(row["cpu_percent"]))
-    out: dict[str, float | None] = {"api": None, "client": None}
+            if role is None:
+                continue
+            try:
+                cpu = float(row["cpu_percent"])
+                t = float(row["t_wall"]) if window is not None else None
+            except (KeyError, TypeError, ValueError):
+                bad += 1
+                continue
+            if t is not None and not window[0] <= t <= window[1]:
+                continue
+            used += 1
+            by_pid.setdefault((role, str(row.get("pid"))), []).append(cpu)
+    out: dict = {"api": None, "client": None, "samples": used, "bad_rows": bad}
     for (role, _), vals in by_pid.items():
         p90 = float(np.percentile(vals, 90))
         out[role] = p90 if out[role] is None else max(out[role], p90)
     return out
 
 
-def _cpu_for(sub_dir: str, session_dir: str) -> tuple[dict[str, float | None], str | None]:
-    for d in (sub_dir, session_dir):
-        path = os.path.join(d, "cpu.csv")
-        if os.path.exists(path):
-            return cpu_p90(path), os.path.relpath(path, session_dir)
-    return {"api": None, "client": None}, None
+def _result_dir_of(argv: Sequence[str]) -> str | None:
+    for i, a in enumerate(argv):
+        if a == "--result-dir" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--result-dir="):
+            return a.split("=", 1)[1]
+    return None
 
 
-def _throttled(sub_dir: str, session_dir: str) -> bool | None:
+def client_window(sub_dir: str, session_dir: str, k: int) -> tuple[float, float] | None:
+    """(t_wall_start, t_wall_end) of the `bench serve` command(s) of client run sub-<k>, from cmd.json (C2).
+
+    A cmd.json inside sub-<k>/ covers that run alone. In the session's cmd.json, a client command belongs to
+    sub-<k> when its --result-dir is that directory. DP2-rand runs two clients at once: the window spans both."""
+    for d, own in ((sub_dir, True), (session_dir, False)):
+        path = os.path.join(d, "cmd.json")
+        if not os.path.exists(path):
+            continue
+        cmds = _read_json(path)
+        wins = []
+        for c in cmds if isinstance(cmds, list) else []:
+            argv = [str(a) for a in (c.get("argv") or [])] if isinstance(c, dict) else []
+            if not _is_client(" ".join(argv)):
+                continue
+            rdir = _result_dir_of(argv)
+            if own or (rdir is not None and os.path.basename(os.path.normpath(rdir)) == f"sub-{k}"):
+                start, end = finite(c.get("t_wall_start")), finite(c.get("t_wall_end"))
+                if start is not None and end is not None:
+                    wins.append((start, end))
+        if wins:
+            return min(w[0] for w in wins), max(w[1] for w in wins)
+    return None
+
+
+_CPU_NONE = {"api": None, "client": None, "samples": 0, "bad_rows": 0}
+
+
+def _cpu_for(sub_dir: str, session_dir: str, k: int) -> tuple[dict, str | None, str | None, list[str]]:
+    """AM11 CPU p90 of one client run: (values, scope, note, errors).
+
+    scope "run": sub-<k>/cpu.csv, or the session cpu.csv inside the client's cmd.json window. scope "session":
+    no window was found, so the p90 is over the whole session, startup included. Parse problems never drop the
+    client result (Review Focus 2): they come back as a note and, when the file is unusable, as an error."""
+    sub_csv, session_csv = os.path.join(sub_dir, "cpu.csv"), os.path.join(session_dir, "cpu.csv")
+    notes: list[str] = []
+    try:
+        name = f"sub-{k}/cpu.csv" if os.path.exists(sub_csv) else "cpu.csv"
+        if os.path.exists(sub_csv):
+            cpu, scope = cpu_p90(sub_csv), "run"
+        elif os.path.exists(session_csv):
+            try:
+                window = client_window(sub_dir, session_dir, k)
+            except _PARSE_ERRORS as e:
+                window = None
+                notes.append(f"cmd.json: {e}")
+            if window is not None:
+                cpu, scope = cpu_p90(session_csv, window), "run"
+                if not cpu["samples"]:
+                    notes.append(f"cpu.csv: no API-server or client samples in the client window "
+                                 f"[{window[0]:.3f}, {window[1]:.3f}]")
+            else:
+                cpu, scope = cpu_p90(session_csv), "session"
+                notes.append("cpu.csv: no client window in cmd.json, p90 over the whole session")
+        else:
+            return dict(_CPU_NONE), None, None, []
+    except (*_PARSE_ERRORS, csv.Error) as e:
+        msg = f"{name}: {e}"
+        return dict(_CPU_NONE), None, msg, [msg]
+    if cpu["bad_rows"]:
+        notes.append(f"{name}: skipped {cpu['bad_rows']} unparseable rows")
+    return cpu, scope, "; ".join(notes) or None, []
+
+
+def _throttled(sub_dir: str, session_dir: str) -> tuple[bool | None, str | None]:
+    """Throttle flag from gpu.csv. The session gpu.csv covers the whole session (nvidia-smi timestamps are box
+    local time, so they are not windowed per client run)."""
     for d in (sub_dir, session_dir):
         path = os.path.join(d, "gpu.csv")
         if os.path.exists(path):
-            flags = monitor.throttle_flags(path)
-            return bool(flags["throttled"]) if flags["rows"] else None
-    return None
+            name = os.path.relpath(path, session_dir)
+            try:
+                flags = monitor.throttle_flags(path)
+            except (*_PARSE_ERRORS, UnicodeDecodeError) as e:
+                return None, f"{name}: {e}"
+            return (bool(flags["throttled"]) if flags["rows"] else None), None
+    return None, None
 
 
 def _metric_deltas(sub_dir: str) -> tuple[dict[str, float] | None, str | None]:
@@ -476,8 +566,8 @@ def _load_sub_result(sub_dir: str) -> results.ServeResult:
     return parts[0] if len(parts) == 1 else results.merge_serve_results(parts)
 
 
-def _sub_row(run: Run, k: int, sub: str) -> tuple[dict, results.ServeResult]:
-    """One online_runs row from a sub-<k>/ client run (ruling R4)."""
+def _sub_row(run: Run, k: int, sub: str) -> tuple[dict, results.ServeResult, list[str]]:
+    """One online_runs row from a sub-<k>/ client run (ruling R4), plus the monitor files it could not read."""
     meta_path = os.path.join(sub, "meta.json")
     meta = _read_json(meta_path) if os.path.exists(meta_path) else {}
     r = _load_sub_result(sub)
@@ -490,16 +580,18 @@ def _sub_row(run: Run, k: int, sub: str) -> tuple[dict, results.ServeResult]:
              "rate_target": rate if rate is not None else r.request_rate}
     row = results.online_row(r, extra)
     deltas, metrics_note = _metric_deltas(sub)
-    cpu, cpu_src = _cpu_for(sub, run.path)
-    throttled = _throttled(sub, run.path)
+    cpu, cpu_scope, cpu_note, errors = _cpu_for(sub, run.path, k)
+    throttled, gpu_error = _throttled(sub, run.path)
+    if gpu_error:
+        errors.append(gpu_error)
     flags = [str(f) for f in validation.get("flags", [])]
     preempt = deltas.get("vllm:num_preemptions_total") if deltas else None
     if preempt and "preempted" not in flags:
         flags.append("preempted")
     if throttled:
         flags.append("throttled")
-    if any(v is not None and v > CPU_FLAG_PCT for v in cpu.values()):
-        flags.append("cpu>80%")
+    if any(cpu[role] is not None and cpu[role] > CPU_FLAG_PCT for role in ("api", "client")):
+        flags.append("cpu>80%" if cpu_scope == "run" else "cpu>80% (session-wide p90)")
     violations = [v for v in (row["violations"], "; ".join(map(str, validation.get("violations", [])))) if v]
     row.update({
         "valid": bool(row["valid"] and validation.get("valid", True)),
@@ -507,10 +599,12 @@ def _sub_row(run: Run, k: int, sub: str) -> tuple[dict, results.ServeResult]:
         "preemptions": preempt,
         "prefix_cache_hits": deltas.get("vllm:prefix_cache_hits_total") if deltas else None,
         "prefix_cache_queries": deltas.get("vllm:prefix_cache_queries_total") if deltas else None,
-        "cpu_api_p90": cpu["api"], "cpu_client_p90": cpu["client"], "cpu_source": cpu_src,
-        "throttled": throttled, "flags": "; ".join(flags), "metrics_note": metrics_note,
+        "cpu_api_p90": cpu["api"], "cpu_client_p90": cpu["client"], "cpu_scope": cpu_scope,
+        "cpu_samples": cpu["samples"], "throttled": throttled, "flags": "; ".join(flags),
+        "metrics_note": metrics_note,
+        "monitor_note": "; ".join(n for n in (cpu_note, gpu_error) if n) or None,
     })
-    return row, r
+    return row, r, errors
 
 
 def _online(runs: Sequence[Run], gaps: _Gaps) -> list[_Sub]:
@@ -519,12 +613,17 @@ def _online(runs: Sequence[Run], gaps: _Gaps) -> list[_Sub]:
         dirs = _sub_dirs(run.path)
         if not dirs and run.status == "done":
             gaps.add("unreadable", "done, but no sub-<k>/ client runs", run)
+        monitor_errors: set[str] = set()
         for k, sub in dirs:
             try:
-                row, r = _sub_row(run, k, sub)
+                row, r, errors = _sub_row(run, k, sub)
             except _PARSE_ERRORS as e:
                 gaps.add("unreadable", f"sub-{k}: {e}", run)
                 continue
+            for msg in errors:
+                if msg not in monitor_errors:          # a broken session file is listed once, not per client run
+                    monitor_errors.add(msg)
+                    gaps.add("partial", f"monitor file unreadable, client results kept: {msg}", run)
             if not row["valid"]:
                 gaps.add("invalid", f"sub-{k} (rate {row['rate_target']}): {row['violations']}", run)
             subs.append(_Sub(row, r))
@@ -729,19 +828,47 @@ def h6_bounds(row: Mapping, exact_steps: int | None) -> dict[str, int]:
     return {"h6_exact_min": max(0, ar_lo + ag_lo - steps), "h6_exact_max": min(ar_hi, ag_hi)}
 
 
-def _sqlite_exact_steps(path: str, tp: int) -> list[int] | None:
-    """Per rank, steps with exactly the expected AR and AG op counts, counted from the trace itself."""
-    try:
-        td = traces.load_trace(path)
-    except (sqlite3.Error, OSError):
-        return None
+def _pure_decode(step: Mapping) -> bool:
+    return step["n_ctx_reqs"] == 0 and step["n_ctx_tokens"] == 0 and step["n_gen_reqs"] == step["n_gen_tokens"] > 0
+
+
+def sqlite_steps(path: str, tp: int) -> list[list[dict]]:
+    """Per rank, one flat row per step of trace.sqlite (spec 7.6 trace_steps): the op counts, GPU busy, the
+    category ms attributed inside the step's own kernels (AM16: overlap goes to the earlier start), and the
+    ms of vLLM's standalone fused_add_rms_norm kernels (the AM16 comm subtraction)."""
+    td = traces.load_trace(path)
     ar, ag = model.allreduces_per_step(tp), model.allgathers_per_step(tp)
-    return [sum(s["ar_ops"] == ar and s["ag_ops"] == ag for s in traces.assign_steps(td, pid, dev))
-            for pid, dev in traces.worker_ranks(td)]
+    out = []
+    for pid, dev in traces.worker_ranks(td):
+        steps = traces.assign_steps(td, pid, dev)
+        rows = []
+        for s in steps:
+            ks = s["kernels"]
+            window = (min(k.start for k in ks), max(k.end for k in ks)) if ks else (0, 0)
+            cats = traces.attribute(ks, window) if ks else dict.fromkeys(kernels.CATEGORIES, 0)
+            norm_ns = traces.union_ns((k.start, k.end) for k in ks if FUSED_ADD_RMS_NORM.search(k.name))
+            row = {"pid": pid, "device": dev, "step": s["index"], "nvtx": s["nvtx"],
+                   "n_ctx_reqs": s["n_ctx_reqs"], "n_ctx_tokens": s["n_ctx_tokens"], "n_gen_reqs": s["n_gen_reqs"],
+                   "n_gen_tokens": s["n_gen_tokens"], "pure_decode": _pure_decode(s),
+                   "last": s["index"] == len(steps) - 1, "step_ms": (s["end"] - s["start"]) / 1e6,
+                   "gpu_busy_ms": s["gpu_busy_ns"] / 1e6, "ar_ops": s["ar_ops"], "ag_ops": s["ag_ops"],
+                   "exact_counts": s["ar_ops"] == ar and s["ag_ops"] == ag}
+            row.update({f"cat_{c}_ms": cats.get(c, 0) / 1e6 for c in kernels.CATEGORIES})
+            row["fused_add_rms_norm_ms"] = norm_ns / 1e6
+            rows.append(row)
+        out.append(rows)
+    return out
 
 
-def _traces(runs: Sequence[Run], gaps: _Gaps) -> list[dict]:
-    rows = []
+def _stat_mean(steps: Sequence[Mapping], key: str) -> float | None:
+    """Mean over the pure decode steps when there are any (as traces.summarize_trace does), else all steps."""
+    stat = [s for s in steps if s["pure_decode"]] or list(steps)
+    return float(np.mean([s[key] for s in stat])) if stat else None
+
+
+def _traces(runs: Sequence[Run], gaps: _Gaps) -> tuple[list[dict], list[dict]]:
+    """(trace_summary rows, one per rank; trace_steps rows, one per rank and step where trace.sqlite exists)."""
+    rows, step_rows = [], []
     for run in _of_kind(runs, "trace"):
         path = os.path.join(run.path, "trace_summary.json")
         if not os.path.exists(path):
@@ -752,16 +879,24 @@ def _traces(runs: Sequence[Run], gaps: _Gaps) -> list[dict]:
             summ = _read_json(path)
             tp = int(run.tp or len(summ["ranks"]) or 1)
             gate = summ.get("gate") or {}
+            gate_ok = gate.get("ok") is True
             sqlite_path = os.path.join(run.path, "trace.sqlite")
-            exact = _sqlite_exact_steps(sqlite_path, tp) if os.path.exists(sqlite_path) else None
-            if not gate.get("ok", False):
-                gaps.add("trace_gate", "; ".join(map(str, gate.get("reasons", []))) or "gate failed", run)
+            by_rank = None
+            if os.path.exists(sqlite_path):
+                try:
+                    by_rank = sqlite_steps(sqlite_path, tp)
+                except (sqlite3.Error, *_PARSE_ERRORS) as e:
+                    gaps.add("unreadable", f"trace.sqlite: {e}", run)
+            if not gate_ok:
+                gaps.add("trace_gate", ("; ".join(map(str, gate.get("reasons", []))) or "gate failed")
+                         + " (excluded from H6, H7 and the AM16 comm time)", run)
+            run_rows = []
             for i, rk in enumerate(summ["ranks"]):
                 ar, ag = rk.get("ar_ops_per_step") or {}, rk.get("ag_ops_per_step") or {}
                 frac = rk.get("category_frac") or {}
                 step_ms, busy = finite(rk.get("mean_step_ms")), finite(rk.get("busy_frac"))
                 row = {"run_id": run.run_id, "tier": run.tier, "config": run.config, "arm": run.arm, "tp": tp,
-                       "points": run.p("points"), "gate_ok": bool(gate.get("ok")),
+                       "points": run.p("points"), "gate_ok": gate_ok,
                        "gate_reasons": "; ".join(map(str, gate.get("reasons", []))),
                        "idle_est": finite(summ.get("idle_est")),
                        "ar_wire_ms": finite(summ.get("ar_wire_s_per_step")) and summ["ar_wire_s_per_step"] * 1e3,
@@ -777,13 +912,58 @@ def _traces(runs: Sequence[Run], gaps: _Gaps) -> list[dict]:
                     row[f"cat_{c}_ms"] = (step_ms * busy * frac.get(c, 0.0)
                                           if step_ms is not None and busy is not None else None)
                 row["idle_ms"] = step_ms * (1 - busy) if step_ms is not None and busy is not None else None
-                n_exact = exact[i] if exact is not None and i < len(exact) else None
-                row["h6_source"] = "trace.sqlite" if n_exact is not None else "summary"
-                row.update(h6_bounds(row, n_exact))
-                rows.append(row)
+                steps = by_rank[i] if by_rank is not None and i < len(by_rank) else None
+                if steps is not None:
+                    row.update(h6_source="trace.sqlite", h6_steps=len(steps),
+                               ar_ms=_stat_mean(steps, "cat_all_reduce_ms"), ar_ms_source="trace.sqlite",
+                               fused_add_rms_norm_ms=_stat_mean(steps, "fused_add_rms_norm_ms"))
+                    row.update(h6_bounds(row, sum(s["exact_counts"] for s in steps)))
+                    for s in steps:
+                        step_rows.append({"run_id": run.run_id, "config": run.config, "arm": run.arm, "tp": tp,
+                                          "points": run.p("points"), "gate_ok": gate_ok, "rank": row["rank"], **s})
+                else:
+                    row.update(h6_source="summary", h6_steps=row["steps"], ar_ms=row["cat_all_reduce_ms"],
+                               ar_ms_source="summary shares", fused_add_rms_norm_ms=None)
+                    row.update(h6_bounds(row, None))
+                run_rows.append(row)
+            rows += run_rows
         except _PARSE_ERRORS as e:
             gaps.add("unreadable", f"trace_summary.json: {e}", run)
-    return rows
+    _comm_time(rows)
+    return rows, step_rows
+
+
+def _comm_time(rows: Sequence[dict]) -> None:
+    """AM16: TP2 comm time per step = fused AR time - TP1's per-step fused_add_rms_norm time.
+
+    The default path (base, G1, G2) fuses residual add + RMSNorm into the all-reduce kernel; TP1 runs that
+    work as standalone fused_add_rms_norm kernels, so their time is subtracted. AR1-AR3 run the RMSNorm as its
+    own kernel, so their AR time is comm time as it stands. The TP1 reference is a gate-passing TP1 trace at
+    the same points (same arm, else base), rank 0, counted from its trace.sqlite."""
+    tp1 = {}
+    for r in rows:
+        if r["config"] == "TP1" and r["gate_ok"] and r["rank"] == 0 and r.get("fused_add_rms_norm_ms") is not None:
+            tp1.setdefault((r["arm"], r["points"]), r)
+    for r in rows:
+        r.update(ar_fused=None, tp1_norm_ms=None, comm_ms=None, comm_note=None)
+        if r["tp"] != 2:
+            continue
+        fused = r["arm"] not in UNFUSED_AR_ARMS
+        r["ar_fused"] = fused
+        if not r["gate_ok"]:
+            r["comm_note"] = "completeness gate failed"
+        elif r["ar_ms"] is None:
+            r["comm_note"] = "no all-reduce time"
+        elif not fused:
+            r.update(comm_ms=r["ar_ms"], comm_note="unfused path: the AR kernels are comm only")
+        else:
+            ref = tp1.get((r["arm"], r["points"])) or tp1.get(("base", r["points"]))
+            if ref is None:
+                r["comm_note"] = (f"no gate-passing TP1 {r['points']} trace with trace.sqlite for the "
+                                  "fused_add_rms_norm time")
+            else:
+                r.update(tp1_norm_ms=ref["fused_add_rms_norm_ms"], comm_ms=r["ar_ms"] - ref["fused_add_rms_norm_ms"],
+                         comm_note=f"fused AR ({r['ar_ms_source']}) - TP1 {ref['arm']} fused_add_rms_norm")
 
 
 # ------------------------------------------------------------------------------------------ gaps, evidence
@@ -811,8 +991,10 @@ def _expected_missing(runs: Sequence[Run], raw_dir: str, effs: Sequence[tuple[Ru
     elif set(tiers) & {"P1", "P2"}:
         gaps.add("missing", "no raw/rate_grid.json: the P1 sweeps and the grid-dependent P2 sessions cannot be "
                             "listed", run_id="rate_grid.json")
+    # The runner plans ROUNDS rounds (T16 default); a session that died before its last rounds leaves no record
+    # of them, so the rounds seen are only a lower bound (Review Focus 2).
     sweep_rounds = [r.round for r in runs if r.kind == "serve_session" and r.p("phase") == "sweep" and r.tier == "P1"]
-    rounds = max(sweep_rounds) if sweep_rounds else ROUNDS
+    rounds = max([ROUNDS, *sweep_rounds])
     try:
         specs = matrix.build_matrix(tiers, grid, _fi_backend(effs), rounds)
     except (ValueError, KeyError, TypeError) as e:
@@ -970,24 +1152,30 @@ def _h2(tables: Mapping, bands: Mapping) -> dict:
 def _h3(tables: Mapping, bands: Mapping) -> dict:
     statement = "DP2's saturation throughput exceeds TP2's in every seed"
     mu: dict[str, dict] = {"TP2": {}, "DP2": {}}
+    seen: set = set(SAT_SEEDS)                      # the planned seeds (matrix sat params), plus any recorded
     for r in tables.get("saturation", []):
-        if (r.get("row"), r.get("arm"), r.get("phase")) == ("seed", "base", "sat") and r.get("config") in mu \
-                and r.get("valid") and r.get("mu_tps") is not None:
-            mu[r["config"]][r["seed"]] = r["mu_tps"]
+        if (r.get("row"), r.get("arm"), r.get("phase")) == ("seed", "base", "sat") and r.get("config") in mu:
+            seen.add(r.get("seed"))
+            if r.get("valid") and r.get("mu_tps") is not None:
+                mu[r["config"]][r["seed"]] = r["mu_tps"]
     band = bands.get("H3")
     absent = [c for c, v in mu.items() if not v]
     if absent:
         return _h("H3", statement, None, band, "insufficient_data",
                   f"no valid base saturation runs for {', '.join(absent)}")
     seeds = sorted(set(mu["TP2"]) & set(mu["DP2"]), key=str)
-    if not seeds:
-        return _h("H3", statement, None, band, "insufficient_data", "TP2 and DP2 saturation runs share no seed")
     ratios = [mu["DP2"][s] / mu["TP2"][s] for s in seeds]
-    note = "DP2/TP2 per seed: " + ", ".join(f"{s}: {x:.3f}" for s, x in zip(seeds, ratios))
-    lonely = sorted(set(mu["TP2"]) ^ set(mu["DP2"]), key=str)
-    if lonely:
-        note += f"; seeds without a pair: {lonely}"
-    return _h("H3", statement, float(np.median(ratios)), band, "hit" if all(x > 1 for x in ratios) else "miss", note)
+    note = "DP2/TP2 per seed: " + (", ".join(f"{s}: {x:.3f}" for s, x in zip(seeds, ratios)) or "none paired")
+    lacking = {c: sorted(seen - set(mu[c]), key=str) for c in mu}
+    lacking = {c: v for c, v in lacking.items() if v}
+    if lacking:
+        note += "; no valid run for seed(s) " + "; ".join(f"{c}: {v}" for c, v in lacking.items())
+    measured = float(np.median(ratios)) if ratios else None
+    if any(x <= 1 for x in ratios):                 # one counterexample decides "in every seed"
+        return _h("H3", statement, measured, band, "miss", note)
+    if lacking:
+        return _h("H3", statement, measured, band, "insufficient_data", note)
+    return _h("H3", statement, measured, band, "hit", note)
 
 
 def _h4(tables: Mapping, bands: Mapping) -> dict:
@@ -1036,14 +1224,19 @@ def _h5(tables: Mapping, bands: Mapping) -> dict:
 def _h6(tables: Mapping) -> dict:
     statement = (f"Every traced TP2 step has exactly {model.allreduces_per_step(2)} all-reduce ops and "
                  f"{model.allgathers_per_step(2)} all-gather (>= {H6_MIN_EXACT:.0%} of steps, all arms)")
-    rows = [r for r in tables.get("trace_summary", []) if r.get("tp") == 2]
-    total = sum(int(r.get("steps") or 0) for r in rows)
+    tp2 = [r for r in tables.get("trace_summary", []) if r.get("tp") == 2]
+    rows = [r for r in tp2 if r.get("gate_ok") is True]        # spec 4.5: a trace is valid only if the gate holds
+    rejected = sorted({r["run_id"] for r in tp2 if r.get("gate_ok") is not True})
+    total = sum(int(r.get("h6_steps", r.get("steps")) or 0) for r in rows)
     if not rows or not total:
-        return _h("H6", statement, None, None, "insufficient_data", "no TP2 trace summaries with steps")
+        why = f"; {len(rejected)} TP2 traces failed the completeness gate: {', '.join(rejected)}" if rejected else ""
+        return _h("H6", statement, None, None, "insufficient_data", "no gate-passing TP2 trace with steps" + why)
     lo = sum(r["h6_exact_min"] for r in rows) / total
     hi = sum(r["h6_exact_max"] for r in rows) / total
     runs = len({r["run_id"] for r in rows})
     note = f"{runs} traces, {total} rank-steps; exact fraction in [{lo:.4f}, {hi:.4f}]"
+    if rejected:
+        note += f"; {len(rejected)} traces excluded by the completeness gate"
     if lo >= H6_MIN_EXACT:
         return _h("H6", statement, lo, None, "hit", note)
     if hi < H6_MIN_EXACT:
@@ -1057,8 +1250,13 @@ def _h7(tables: Mapping) -> dict:
                  "ordered base < G1 < G2")
     idle: dict[str, list[float]] = {}
     tp1_g2 = []
+    rejected: dict[str, int] = {}
     for r in tables.get("trace_summary", []):
         if r.get("points") != "decode:b1" or r.get("idle_est") is None:
+            continue
+        if r.get("gate_ok") is not True:            # spec 4.5: a trace is valid only if the gate holds
+            if r.get("tp") == 2:
+                rejected[r["arm"]] = rejected.get(r["arm"], 0) + 1
             continue
         if r.get("tp") == 2:
             idle.setdefault(r["arm"], []).append(r["idle_est"])
@@ -1066,11 +1264,13 @@ def _h7(tables: Mapping) -> dict:
             tp1_g2.append(r["idle_est"])
     v = {a: median_or_none(idle.get(a, [])) for a in ("base", "G1", "G2")}
     absent = [a for a, x in v.items() if x is None]
+    why = f" ({len(rejected)} arm(s) with traces rejected by the completeness gate: {', '.join(sorted(rejected))})" \
+        if rejected else ""
     if absent:
         return _h("H7", statement, {a: x for a, x in v.items() if x is not None} or None, None, "insufficient_data",
-                  f"no TP2 decode:b1 trace idle_est for arm(s): {', '.join(absent)}")
+                  f"no gate-passing TP2 decode:b1 trace idle_est for arm(s): {', '.join(absent)}" + why)
     ok = v["base"] < H7_BASE_MAX and v["G2"] > H7_G2_MIN and v["base"] < v["G1"] < v["G2"]
-    note = ", ".join(f"{a} {x:.3f}" for a, x in v.items())
+    note = ", ".join(f"{a} {x:.3f}" for a, x in v.items()) + why
     if tp1_g2:
         note += f"; TP1 G2 {median_or_none(tp1_g2):.3f} (predicted < {H7_G2_MIN:.2f})"
     return _h("H7", statement, v, None, "hit" if ok else "miss", note)
@@ -1144,6 +1344,7 @@ def analyze(results_dir: str) -> dict[str, list[dict]]:
     points = _rate_points(subs)
     gp = _goodput(points)
     kv, effs = _kv(runs, gaps)
+    trace_rows, trace_steps = _traces(runs, gaps)
     tables: dict[str, list[dict]] = {
         "offline_points": offline_rows,
         "online_runs": online_rows,
@@ -1152,7 +1353,8 @@ def analyze(results_dir: str) -> dict[str, list[dict]]:
         "s_star": _s_star(points, gp),
         "comm": _comm(runs, gaps),
         "kv_capacity": kv,
-        "trace_summary": _traces(runs, gaps),
+        "trace_summary": trace_rows,
+        "trace_steps": trace_steps,
         "efficiency_delta": efficiency_delta(lat),
         "confounders": _confounders(results_dir, effs, online_rows),
     }

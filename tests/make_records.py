@@ -5,9 +5,12 @@ Analysis tests use this instead of the runner. Every run directory is named by a
 `done.json` or `failed.json`, plus the kind's outputs:
 
 - offline: C3 point files under `<run_dir>/points/`
-- serve_session: `sub-<k>/` with `result.json` (C7), `client.log`, `metrics_before.prom`,
-  `metrics_after.prom`, `validation.json`, `meta.json` {phase, rate, seed, config, arm, round, k}
-- trace: `trace_summary.json` shaped like `traces.summarize_trace`
+- serve_session: `cmd.json` with the server command and one `vllm bench serve` command per client
+  (its `--result-dir` is `sub-<k>`), `cpu.csv` sampled over the whole session, `gpu.csv`, and
+  `sub-<k>/` with `result.json` (C7), `client.log`, `metrics_before.prom`, `metrics_after.prom`,
+  `validation.json`, `meta.json` {phase, rate, seed, config, arm, round, k}
+- trace: `trace_summary.json` shaped like `traces.summarize_trace`, plus a synthetic `trace.sqlite`
+  (tests/synth_trace.py) for the traces listed in `sqlite_traces`
 - comm_*: `comm_rows.jsonl` (M3 / M2 / M1 / M4 row shapes)
 - engine runs: `effective_config.json` = `dataclasses.asdict(logparse.EffectiveConfig)` + "violations"
 - `raw/rate_grid.json` = {mu_rps, grid, sources}; `raw/_last_run.json` lists done/failed/skipped
@@ -35,6 +38,8 @@ from tpprof.constants import (
 )
 from tpprof.offline import parse_points
 
+from tests import synth_trace
+
 FIXTURE_RESULT = os.path.join(os.path.dirname(__file__), "fixtures", "bench_serve_result_detailed.json")
 T0 = 1_790_000_000.0
 C = model.CONSTANTS["central"]
@@ -51,6 +56,14 @@ IDLE_B1 = {("TP1", "base"): 0.03, ("TP1", "G1"): 0.08, ("TP1", "G2"): 0.20,
            ("TP2", "base"): 0.05, ("TP2", "G1"): 0.15, ("TP2", "G2"): 0.40}
 GPU1_STEP_FACTOR = 1.005                                       # AM14: GPU1 0.5% slower than GPU0
 SAT_TPOT_S = 0.001
+# Traces that also get a trace.sqlite (trace_steps, exact H6 counts, the AM16 comm subtraction).
+SQLITE_TRACES = (("TP1", "base", "decode:b1"), ("TP2", "base", "decode:b1"))
+SQLITE_STEPS = 16
+# Session timeline (s after the session start): the server starts, then client k runs in
+# [CLIENT_T0 + k * CLIENT_PERIOD, + CLIENT_S]. cpu.csv is sampled every CPU_PERIOD over the whole session.
+CLIENT_T0, CLIENT_PERIOD, CLIENT_S, CPU_PERIOD = 10.0, 3.0, 2.0, 0.5
+API_CPU_STARTUP = 100.0            # the API server's startup burst; a whole-session p90 would pick it up
+API_CPU_IDLE = 5.0
 ITL_CHUNKS = 15                                                # SSE chunks per request (D4-14)
 
 
@@ -65,7 +78,8 @@ def default_skip(spec: matrix.RunSpec) -> bool:
 def build(results_dir: str, tiers: Iterable[str] = ("P0", "P1", "P2"), rounds: int = 3,
           fi_backend: str = "trtllm", engine: str = "fake", sat_prompts: int = 100, sweep_prompts: int = 40,
           fail: Callable[[matrix.RunSpec], bool] = default_fail,
-          skip: Callable[[matrix.RunSpec], bool] = default_skip) -> list[matrix.RunSpec]:
+          skip: Callable[[matrix.RunSpec], bool] = default_skip,
+          sqlite_traces: Iterable[tuple[str, str, str]] = SQLITE_TRACES) -> list[matrix.RunSpec]:
     """Write a complete synthetic results dir; returns the specs of the matrix (done, failed and skipped)."""
     raw = os.path.join(results_dir, "raw")
     os.makedirs(raw, exist_ok=True)
@@ -75,6 +89,7 @@ def build(results_dir: str, tiers: Iterable[str] = ("P0", "P1", "P2"), rounds: i
     _write_json(os.path.join(raw, "rate_grid.json"), {"mu_rps": MU_RPS, "grid": grid, "sources": sat_ids})
     summary: dict[str, list] = {"done": [], "failed": [], "skipped": []}
     booted: set[str] = set()
+    sqlite_traces = set(sqlite_traces)
     for i, spec in enumerate(specs):
         if skip(spec):
             summary["skipped"].append({"run_id": spec.run_id, "reason": "dependency_failed:synthetic"})
@@ -90,7 +105,7 @@ def build(results_dir: str, tiers: Iterable[str] = ("P0", "P1", "P2"), rounds: i
                          "detail": "EngineCore failed to start.", "log_tails": {"engine.log": ["EngineCore failed"]}})
             summary["failed"].append(spec.run_id)
             continue
-        _write_outputs(spec, run_dir, engine, fi_backend, booted, sat_prompts, sweep_prompts)
+        _write_outputs(spec, run_dir, engine, fi_backend, booted, sat_prompts, sweep_prompts, t, sqlite_traces)
         _write_json(os.path.join(run_dir, "done.json"),
                     {"run_id": spec.run_id, "status": "done", "duration_s": 30.0, "artifacts": []})
         summary["done"].append(spec.run_id)
@@ -122,7 +137,7 @@ def _engine_names(config: str) -> list[str]:
 
 
 def _write_outputs(spec: matrix.RunSpec, run_dir: str, engine: str, fi_backend: str, booted: set[str],
-                   sat_prompts: int, sweep_prompts: int) -> None:
+                   sat_prompts: int, sweep_prompts: int, t: float, sqlite_traces: set[tuple[str, str, str]]) -> None:
     kind = spec.kind
     if kind in ("smoke", "offline", "bench_latency_xcheck", "trace", "serve_session"):
         write_effective_config(run_dir, spec, fi_backend, cold=spec.config not in booted)
@@ -150,8 +165,11 @@ def _write_outputs(spec: matrix.RunSpec, run_dir: str, engine: str, fi_backend: 
     elif kind == "trace":
         _write_json(os.path.join(run_dir, "trace_summary.json"),
                     trace_summary(spec.config, spec.arm, str(spec.p("points"))))
+        if (spec.config, spec.arm, str(spec.p("points"))) in sqlite_traces:
+            write_trace_sqlite(os.path.join(run_dir, "trace.sqlite"), spec.config, fi_backend,
+                               int(str(spec.p("points")).split(":b")[1]))
     elif kind == "serve_session":
-        write_session(run_dir, spec, sat_prompts, sweep_prompts)
+        write_session(run_dir, spec, sat_prompts, sweep_prompts, t)
     elif kind.startswith("comm_"):
         with open(os.path.join(run_dir, "comm_rows.jsonl"), "w") as f:
             for row in comm_rows(kind, str(spec.p("variant", "none:none"))):
@@ -233,6 +251,14 @@ def trace_summary(config: str, arm: str, points: str) -> dict:
             "idle_est": idle, "window_ns": [0, int(steps * step_ms * 1e6)], "launch_ts_missing": 0}
 
 
+def write_trace_sqlite(path: str, config: str, fi_backend: str, batch: int, steps: int = SQLITE_STEPS) -> None:
+    """A synthetic nsys export with `steps` pure decode steps per rank (TP2: 65 AR + 1 AG per step)."""
+    tp = _tp(config)
+    ranks = [{"pid": 42420 + r, "device": r, "tp": tp, "ar_backend": fi_backend if tp == 2 else "none",
+              "batch": batch, "steps": [[0, 0, batch, batch]] * steps, "drop_last": 0} for r in range(tp)]
+    synth_trace.build_trace_db(path, ranks, measure=synth_trace.trace_span(ranks))
+
+
 # ------------------------------------------------------------------------------------------ comm
 
 def comm_rows(kind: str, variant: str) -> list[dict]:
@@ -283,15 +309,42 @@ def _sub_runs(spec: matrix.RunSpec) -> list[tuple[str, float, int]]:
     raise ValueError(f"unknown phase {phase!r}")
 
 
-def write_session(run_dir: str, spec: matrix.RunSpec, sat_prompts: int, sweep_prompts: int) -> None:
-    _write_cpu_csv(os.path.join(run_dir, "cpu.csv"), api_cpu=90.0 if (spec.config, spec.p("phase")) == ("DP2", "sat")
-                   and spec.arm == "base" else 35.0)
+def api_cpu_level(spec: matrix.RunSpec, k: int, n_subs: int) -> float:
+    """The API server's synthetic CPU% while client k runs: 90 in DP2's base saturation runs, rising with the
+    rate in a sweep (the top rate is above the AM11 80% line), 35 otherwise."""
+    if spec.p("phase") == "sweep":
+        return 20.0 + 65.0 * k / max(n_subs - 1, 1)
+    return 90.0 if (spec.config, spec.p("phase"), spec.arm) == ("DP2", "sat", "base") else 35.0
+
+
+def client_windows(t: float, n_subs: int) -> list[tuple[float, float]]:
+    return [(t + CLIENT_T0 + k * CLIENT_PERIOD, t + CLIENT_T0 + k * CLIENT_PERIOD + CLIENT_S) for k in range(n_subs)]
+
+
+def write_session(run_dir: str, spec: matrix.RunSpec, sat_prompts: int, sweep_prompts: int, t: float = T0) -> None:
+    subs = _sub_runs(spec)
+    windows = client_windows(t, len(subs))
+    t_end = windows[-1][1] + 1.0
+    n_clients = 2 if spec.config == "DP2rand" else 1
+    cmds = [{**_cmd(spec, t), "argv": ["vllm", "serve", "/models", "--port", "8000"], "t_wall_end": t_end,
+             "t_mono_end": t_end - T0, "log": "server.log"}]
+    for k, (w0, w1) in enumerate(windows):
+        for c in range(n_clients):
+            cmds.append({"argv": ["vllm", "bench", "serve", "--backend", "vllm", "--result-dir",
+                                  os.path.join(run_dir, f"sub-{k}"), "--result-filename",
+                                  "result.json" if n_clients == 1 else f"result-{c}.json"],
+                         "env_overrides": {}, "cwd": None, "t_wall_start": w0, "t_mono_start": w0 - T0,
+                         "t_wall_end": w1, "t_mono_end": w1 - T0, "exit_code": 0, "timed_out": False,
+                         "log": f"sub-{k}/client-{c}.log"})
+    _write_json(os.path.join(run_dir, "cmd.json"), cmds)
+    _write_cpu_csv(os.path.join(run_dir, "cpu.csv"), t, t_end, windows,
+                   [api_cpu_level(spec, k, len(subs)) for k in range(len(subs))])
     with open(os.path.join(run_dir, "gpu.csv"), "w") as f:
         f.write("timestamp,index,clocks.sm,clocks.mem,power.draw,temperature.gpu,utilization.gpu,memory.used,"
                 "clocks_event_reasons.active\n")
         for i in range(3):
             f.write(f"2026/10/01 10:00:0{i}.000, 0, 1980, 2619, 400.00, 55, 90, 70000, 0x0000000000000000\n")
-    for k, (phase, rate, seed) in enumerate(_sub_runs(spec)):
+    for k, (phase, rate, seed) in enumerate(subs):
         sub = os.path.join(run_dir, f"sub-{k}")
         os.makedirs(sub, exist_ok=True)
         n = sat_prompts if rate == float("inf") else sweep_prompts
@@ -314,15 +367,23 @@ def write_session(run_dir: str, spec: matrix.RunSpec, sat_prompts: int, sweep_pr
                      "config": spec.config, "arm": spec.arm, "round": spec.round, "k": k})
 
 
-def _write_cpu_csv(path: str, api_cpu: float) -> None:
+def _write_cpu_csv(path: str, t0: float, t_end: float, windows: list[tuple[float, float]],
+                   api_levels: list[float]) -> None:
+    """The API server (startup burst, then its level during each client window, idle between), an engine core,
+    and one bench-serve client process per window, sampled every CPU_PERIOD."""
+    lines = ["t_wall,pid,ppid,name,cmd,cpu_percent,rss_mib\n"]
+    for i in range(int((t_end - t0) / CPU_PERIOD) + 1):
+        t = t0 + i * CPU_PERIOD
+        k = next((j for j, (w0, w1) in enumerate(windows) if w0 <= t <= w1), None)
+        api = API_CPU_STARTUP if t < windows[0][0] - 1.0 else api_levels[k] if k is not None else API_CPU_IDLE
+        lines.append(f"{t:.3f},100,1,python3,/usr/bin/python3 /usr/local/bin/vllm serve /models --port 8000,"
+                     f"{api + (i % 3 - 1):.1f},900.0\n")
+        lines.append(f"{t:.3f},101,100,VLLM::EngineCore,VLLM::EngineCore,99.0,2000.0\n")
+        if k is not None:
+            lines.append(f"{t:.3f},{200 + k},1,vllm,/usr/bin/python3 /usr/local/bin/vllm bench serve --backend vllm,"
+                         f"{20 + i % 5:.1f},300.0\n")
     with open(path, "w") as f:
-        f.write("t_wall,pid,ppid,name,cmd,cpu_percent,rss_mib\n")
-        for i in range(10):
-            f.write(f"{T0 + i:.3f},100,1,python3,/usr/bin/python3 /usr/local/bin/vllm serve /models --port 8000,"
-                    f"{api_cpu - 5 + i:.1f},900.0\n")
-            f.write(f"{T0 + i:.3f},101,100,VLLM::EngineCore,VLLM::EngineCore,99.0,2000.0\n")
-            f.write(f"{T0 + i:.3f},200,1,vllm,/usr/bin/python3 /usr/local/bin/vllm bench serve --backend vllm,"
-                    f"{20 + i:.1f},300.0\n")
+        f.writelines(lines)
 
 
 def _prom(preemptions: float, hits: float, requests: float) -> str:

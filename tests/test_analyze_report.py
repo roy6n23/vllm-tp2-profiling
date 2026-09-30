@@ -119,6 +119,66 @@ def test_online_saturation_goodput_and_s_star(tables):
     assert summary["ci_lo_ms"] is not None and summary["ci_lo_ms"] <= summary["ci_hi_ms"]
 
 
+def _session(raw: str, prefix: str) -> str:
+    return os.path.join(raw, next(n for n in sorted(os.listdir(raw)) if n.startswith(prefix)))
+
+
+def test_cpu_p90_is_per_client_run(records, tables):
+    """AM11: each client run gets the p90 of its own cmd.json window, not of the whole session."""
+    session = _session(os.path.join(records, "raw"), "P1-serve_session-TP2-base-r1")
+    rows = sorted((r for r in tables["online_runs"] if r["run_id"] == os.path.basename(session)),
+                  key=lambda r: r["sub"])
+    assert len(rows) == 6 and all(r["cpu_scope"] == "run" and r["cpu_samples"] for r in rows)
+    levels = [make_records.api_cpu_level(make_records.matrix.RunSpec("serve_session", "TP2", "base", "P1",
+                                                                     (("phase", "sweep"),)), k, 6) for k in range(6)]
+    for r, level in zip(rows, levels):
+        assert r["cpu_api_p90"] == pytest.approx(level, abs=1.0)        # never the startup burst
+        assert 20 <= r["cpu_client_p90"] < 25
+    assert ["cpu>80%" in r["flags"] for r in rows] == [False] * 5 + [True]
+    whole = analyze.cpu_p90(os.path.join(session, "cpu.csv"))            # what a session-wide p90 would say
+    assert whole["api"] > analyze.CPU_FLAG_PCT
+
+
+def test_cpu_without_a_client_window_is_marked_session_wide(tmp_path):
+    d = _small(tmp_path, tiers=("P1",))
+    session = _session(os.path.join(d, "raw"), "P1-serve_session-TP2-base-r1")
+    with open(os.path.join(session, "cmd.json")) as f:
+        cmds = json.load(f)
+    with open(os.path.join(session, "cmd.json"), "w") as f:
+        json.dump([c for c in cmds if "bench" not in c["argv"]], f)           # the server command only
+    rows = [r for r in analyze.analyze(d)["online_runs"] if r["run_id"] == os.path.basename(session)]
+    assert rows and all(r["cpu_scope"] == "session" for r in rows)
+    assert all("cpu>80% (session-wide p90)" in r["flags"] and "whole session" in r["monitor_note"] for r in rows)
+
+
+def test_broken_monitor_files_keep_the_client_results(tmp_path):
+    """Review Focus 2: a bad cpu.csv or gpu.csv costs the CPU/throttle columns, never the client results."""
+    d = _small(tmp_path, tiers=("P1",))
+    raw = os.path.join(d, "raw")
+    before = analyze.analyze(d)
+    tp2 = _session(raw, "P1-serve_session-TP2-base-r1")
+    with open(os.path.join(tp2, "cpu.csv"), "a") as f:
+        f.write(f"{make_records.T0 + 5:.3f},100,1,python3,/usr/bin/python3 /usr/local/bin/vllm serve /models,")
+    dp2 = _session(raw, "P1-serve_session-DP2-base-r1")
+    with open(os.path.join(dp2, "cpu.csv"), "w") as f:
+        f.write("t_wall,pid,cmd,cpu_percent\n1.0,7,\"" + "x" * 200_000 + "\n")  # csv.Error: field limit
+    with open(os.path.join(dp2, "gpu.csv"), "wb") as f:
+        f.write(b"\xff\xfe garbage\n")
+    after = analyze.analyze(d)
+    assert len(after["online_runs"]) == len(before["online_runs"])
+    for config in ("TP2", "DP2"):
+        assert any(r["config"] == config and r["round"] == 1 for r in after["goodput"])
+    tp2_rows = [r for r in after["online_runs"] if r["run_id"] == os.path.basename(tp2)]
+    assert all(r["cpu_api_p90"] is not None for r in tp2_rows)
+    assert any("cpu.csv: skipped 1 unparseable rows" in (r["monitor_note"] or "") for r in tp2_rows)
+    dp2_rows = [r for r in after["online_runs"] if r["run_id"] == os.path.basename(dp2)]
+    assert dp2_rows and all(r["cpu_api_p90"] is None and "cpu.csv" in r["monitor_note"] for r in dp2_rows)
+    partial = [g for g in after["gaps"] if g["type"] == "partial" and g["run_id"] == os.path.basename(dp2)]
+    assert len(partial) == 1 and "cpu.csv" in partial[0]["detail"]            # listed once per session file
+    h = _by_id(analyze.evaluate_hypotheses(after, model.predictions()))
+    assert h["H4"]["verdict"] != "insufficient_data"
+
+
 def test_comm_rows_and_alpha_beta_fits(tables):
     comm = tables["comm"]
     assert {r["source"] for r in comm} == {"comm_m1", "comm_m2", "comm_m3", "comm_m4"}
@@ -149,10 +209,71 @@ def test_trace_summary_is_flat_per_rank(tables):
     rows = tables["trace_summary"]
     tp2_b1 = [r for r in rows if (r["config"], r["arm"], r["points"]) == ("TP2", "base", "decode:b1")]
     assert [r["rank"] for r in tp2_b1] == [0, 1]
-    assert all(r["ar_mode"] == 65 and r["ag_mode"] == 1 and r["h6_exact_min"] == r["steps"] for r in tp2_b1)
+    assert all(r["ar_mode"] == 65 and r["ag_mode"] == 1 for r in tp2_b1)
+    # this trace has a trace.sqlite, so H6 counts its steps exactly
+    assert all(r["h6_source"] == "trace.sqlite" and r["h6_exact_min"] == r["h6_steps"] == make_records.SQLITE_STEPS
+               for r in tp2_b1)
     assert tp2_b1[0]["unclassified_frac"] == pytest.approx(0.01)
     assert sum(tp2_b1[0][f"cat_{c}_ms"] for c in kernels.CATEGORIES) + tp2_b1[0]["idle_ms"] == \
         pytest.approx(tp2_b1[0]["mean_step_ms"])
+
+
+def test_trace_steps_and_am16_comm_time(records, tables):
+    steps = tables["trace_steps"]
+    by_trace: dict[tuple, list[dict]] = {}
+    for r in steps:
+        by_trace.setdefault((r["config"], r["arm"], r["points"], r["rank"]), []).append(r)
+    assert set(by_trace) == {("TP1", "base", "decode:b1", 0), ("TP2", "base", "decode:b1", 0),
+                             ("TP2", "base", "decode:b1", 1)}
+    assert all(len(v) == make_records.SQLITE_STEPS for v in by_trace.values())
+    tp2 = by_trace[("TP2", "base", "decode:b1", 0)]
+    assert all(s["ar_ops"] == 65 and s["ag_ops"] == 1 and s["exact_counts"] and s["pure_decode"] for s in tp2)
+    assert all(sum(s[f"cat_{c}_ms"] for c in kernels.CATEGORIES) == pytest.approx(s["gpu_busy_ms"]) for s in tp2)
+    assert _read_csv(os.path.join(records, "tidy", "trace_steps.csv"))
+    # AM16: TP1 runs 65 standalone fused_add_rms_norm kernels of 2.5 us per step (tests/synth_trace.py)
+    tp1_norm = 65 * 2_500 / 1e6
+    assert by_trace[("TP1", "base", "decode:b1", 0)][0]["fused_add_rms_norm_ms"] == pytest.approx(tp1_norm)
+    rows = {(r["config"], r["arm"], r["points"], r["rank"]): r for r in tables["trace_summary"]}
+    base = rows[("TP2", "base", "decode:b1", 0)]
+    assert base["ar_fused"] and base["ar_ms_source"] == "trace.sqlite"
+    assert base["tp1_norm_ms"] == pytest.approx(tp1_norm)
+    assert base["comm_ms"] == pytest.approx(base["ar_ms"] - tp1_norm) and 0 < base["comm_ms"] < base["ar_ms"]
+    ar3 = rows[("TP2", "AR3", "decode:b1", 0)]                               # unfused: AR time is comm time
+    assert ar3["ar_fused"] is False and ar3["comm_ms"] == pytest.approx(ar3["ar_ms"])
+    b32 = rows[("TP2", "base", "decode:b32", 0)]                             # no TP1 decode:b32 trace.sqlite
+    assert b32["comm_ms"] is None and "TP1 decode:b32" in b32["comm_note"]
+    assert rows[("TP1", "base", "decode:b1", 0)]["comm_ms"] is None
+
+
+def test_gate_failed_traces_decide_no_hypothesis(tmp_path):
+    """Spec 4.5: a trace is valid only if the completeness gate holds."""
+    pred = model.predictions()
+    bad = lambda **kw: _trace_row(0, 0, 0, gate_ok=False, **kw)              # would be an H6 miss if counted
+    h = _by_id(analyze.evaluate_hypotheses(_tables_with(trace_summary=[bad()]), pred))
+    assert h["H6"]["verdict"] == "insufficient_data" and "completeness gate" in h["H6"]["note"]
+    h = _by_id(analyze.evaluate_hypotheses(_tables_with(trace_summary=[bad(), _trace_row(65, 65, 65)]), pred))
+    assert h["H6"]["verdict"] == "hit" and "excluded" in h["H6"]["note"]
+    rows = [_trace_row(65, 65, 65, arm=a, idle_est=v) for a, v in (("base", 0.05), ("G1", 0.15))]
+    rows.append(_trace_row(65, 65, 65, arm="G2", idle_est=0.01, gate_ok=False))  # would make H7 a miss
+    h7 = _by_id(analyze.evaluate_hypotheses(_tables_with(trace_summary=rows), pred))["H7"]
+    assert h7["verdict"] == "insufficient_data" and "G2" in h7["note"] and "completeness gate" in h7["note"]
+
+    d = _small(tmp_path, tiers=("P0",))
+    raw = os.path.join(d, "raw")
+    for name in os.listdir(raw):
+        if name.startswith("P0-trace-TP2"):
+            path = os.path.join(raw, name, "trace_summary.json")
+            with open(path) as f:
+                doc = json.load(f)
+            doc["gate"] = {"ok": False, "reasons": ["rank 1 has 253 steps, rank 0 has 256"]}
+            with open(path, "w") as f:
+                json.dump(doc, f)
+    tables = analyze.analyze(d)
+    tp2 = [r for r in tables["trace_summary"] if r["tp"] == 2]
+    assert tp2 and not any(r["gate_ok"] for r in tp2) and all(r["comm_ms"] is None for r in tp2)
+    assert any(g["type"] == "trace_gate" and "253 steps" in g["detail"] for g in tables["gaps"])
+    h = _by_id(analyze.evaluate_hypotheses(tables, pred))
+    assert h["H6"]["verdict"] == h["H7"]["verdict"] == "insufficient_data"
 
 
 # ------------------------------------------------------------------------------------------ hypotheses
@@ -199,10 +320,26 @@ def test_h1_h8_miss_outside_band_and_insufficient_when_missing():
     assert "TP2" in empty["H1"]["note"] and "AR3" in empty["H8"]["note"]
 
 
+def _sat_row(config: str, seed: int, mu: float, valid: bool = True) -> dict:
+    return {"row": "seed", "config": config, "arm": "base", "phase": "sat", "seed": seed, "valid": valid,
+            "mu_tps": mu}
+
+
+def test_h3_needs_every_seed_of_both_configs():
+    pred = model.predictions()
+    h3 = lambda rows: _by_id(analyze.evaluate_hypotheses(_tables_with(saturation=rows), pred))["H3"]
+    full = [_sat_row("TP2", s, 100.0) for s in (1, 2, 3)] + [_sat_row("DP2", s, 120.0) for s in (1, 2, 3)]
+    assert h3(full)["verdict"] == "hit"
+    one_tp2 = [_sat_row("TP2", 1, 100.0), _sat_row("TP2", 2, 90.0, valid=False)] + full[3:]
+    got = h3(one_tp2)                                   # seeds 2 and 3 of TP2 are unknown
+    assert got["verdict"] == "insufficient_data" and "TP2: [2, 3]" in got["note"]
+    assert h3([_sat_row("TP2", 1, 130.0)] + full[3:])["verdict"] == "miss"   # one counterexample decides
+
+
 def _trace_row(ar_min: int, ar_max: int, ar_mode: int, steps: int = 256, **kw) -> dict:
     row = {"run_id": "r", "config": "TP2", "arm": "base", "tp": 2, "points": "decode:b1", "rank": 0,
            "steps": steps, "ar_min": ar_min, "ar_max": ar_max, "ar_mode": ar_mode, "ag_min": 1, "ag_max": 1,
-           "ag_mode": 1, "idle_est": 0.05}
+           "ag_mode": 1, "idle_est": 0.05, "gate_ok": True}
     row.update(kw)
     row.update(analyze.h6_bounds(row, None))
     return row
@@ -260,9 +397,20 @@ def test_report_handles_missing_configs(tmp_path):
     text = pathlib.Path(out).read_text(encoding="utf-8")
     gaps = text.split("## Gaps", 1)[1]
     missing = [line for line in gaps.splitlines() if "| missing |" in line]
-    assert missing and all("| DP2 |" in line for line in missing)
+    # besides DP2, only the P1 sweep rounds that _small never ran (it builds 1 of ROUNDS rounds)
+    others = [line for line in missing if "| DP2 |" not in line]
+    assert missing and all("P1-serve_session-" in line and ("-r2-" in line or "-r3-" in line) for line in others)
     assert any("P0-smoke-DP2-base" in line for line in missing)
     assert any("serve_session" in line for line in missing)
+
+
+def test_rounds_that_never_started_are_listed_as_missing(tmp_path):
+    """Review Focus 2: a session that died before its last rounds leaves no record of them."""
+    d = _small(tmp_path, tiers=("P1",))                  # 1 of ROUNDS sweep rounds
+    missing = {g["run_id"] for g in analyze.analyze(d)["gaps"] if g["type"] == "missing"}
+    expected = {s.run_id for s in make_records.matrix.build_matrix(("P1",), make_records.matrix.rate_grid(
+        make_records.MU_RPS), "trtllm", analyze.ROUNDS) if s.round > 1}
+    assert len(expected) == 3 * (analyze.ROUNDS - 1) and missing == expected
 
 
 def test_summary_sections_watermark_and_gaps(records, tables, hyps, tmp_path):

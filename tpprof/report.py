@@ -151,7 +151,9 @@ def _online(t: Tables) -> list[str]:
                    "grid mu (req/s)"),
                   ((r["config"], r["arm"], r["phase"], r["n_seeds"], _f(r["mu_tps"]), _f(r["mu_rps"]),
                     _f(r["preempt_per_1k"]), _f(r.get("grid_mu_rps"))) for r in sat if r.get("row") == "median"))
-    out += ["### Client runs", ""]
+    out += ["### Client runs", "", "CPU p90 is per client run: the samples of the session's cpu.csv inside the "
+            "client's cmd.json window (AM11). A value marked `(session)` had no window and covers the whole "
+            "session, startup included.", ""]
     runs = sorted(t.get("online_runs", []), key=lambda r: (str(r["phase"]), str(r["config"]), str(r["arm"]),
                                                            r["round"] or 0, r["rate_target"] or 0))
     out += _table(("phase", "config", "arm", "round", "rate", "valid", "tput (tok/s)", "TTFT p50/p99 (ms)",
@@ -159,7 +161,8 @@ def _online(t: Tables) -> list[str]:
                   ((r["phase"], r["config"], r["arm"], r["round"], _f(r["rate_target"]), r["valid"],
                     _f(r["tput_uniform_tps"]), f"{_ms(r['ttft_p50_s'])} / {_ms(r['ttft_p99_s'])}",
                     f"{_ms(r['tpot_p50_s'])} / {_ms(r['tpot_p99_s'])}", _f(r["preemptions"]),
-                    f"{_f(r['cpu_api_p90'], 3)} / {_f(r['cpu_client_p90'], 3)}", r["flags"] or "")
+                    f"{_f(r['cpu_api_p90'], 3)} / {_f(r['cpu_client_p90'], 3)}"
+                    + (" (session)" if r.get("cpu_scope") == "session" else ""), r["flags"] or "")
                    for r in runs))
     out += [f"### Goodput (req/s, TTFT <= {TTFT_SLO_S:g} s, median over rounds)", ""]
     gp = [r for r in t.get("goodput", []) if r.get("ttft_slo_s") == TTFT_SLO_S and r.get("arm") == "base"]
@@ -187,14 +190,19 @@ def _communication(t: Tables) -> list[str]:
 
 def _traces(t: Tables) -> list[str]:
     out = ["## Traces", "", "Traced shares are fractions of the traced window; nsys step times are not headline "
-           "latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16).", ""]
+           "latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16). A trace that "
+           "fails the completeness gate is listed but decides no hypothesis (spec 4.5). TP2 comm = fused AR time "
+           "- TP1's per-step fused_add_rms_norm time (AM16); AR1-AR3 are unfused, so their AR time is comm. "
+           "Per-step rows are in `tidy/trace_steps.csv`.", ""]
     rows = [r for r in t.get("trace_summary", []) if r.get("rank") == 0]
     return out + _table(("config", "arm", "points", "gate", "steps", "AR/AG per step (mode)", "idle_est",
-                         "unclassified", "AR wire / sync (ms/step)", "run"),
+                         "unclassified", "AR wire / sync (ms/step)", "AR / TP1 norm / comm (ms/step)", "run"),
                         ((r["config"], r["arm"], r["points"], "ok" if r["gate_ok"] else f"FAIL: {r['gate_reasons']}",
                           r["steps"], f"{r['ar_mode']} / {r['ag_mode']}", _f(r["idle_est"], 3),
                           _f(r["unclassified_frac"], 3), f"{_f(r['ar_wire_ms'], 3)} / {_f(r['ar_sync_ms'], 3)}",
-                          r["run_id"]) for r in rows))
+                          (f"{_f(r.get('ar_ms'), 3)} / {_f(r.get('tp1_norm_ms'), 3)} / {_f(r.get('comm_ms'), 3)}"
+                           + (f" ({r['comm_note']})" if r.get("comm_ms") is None and r.get("comm_note") else ""))
+                          if r.get("tp") == 2 else "", r["run_id"]) for r in rows))
 
 
 def _kv(t: Tables) -> list[str]:

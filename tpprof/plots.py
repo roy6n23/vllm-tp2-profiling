@@ -183,7 +183,8 @@ def _trace_breakdown(plt, t: Tables, axes) -> bool:
     drawn = False
     for ax, kind in zip(axes, ("decode", "prefill")):
         rows = [r for r in t.get("trace_summary", []) if r.get("arm") == "base" and r.get("rank") == 0
-                and str(r.get("points", "")).startswith(kind) and r.get("mean_step_ms") is not None]
+                and r.get("gate_ok") is True and str(r.get("points", "")).startswith(kind)
+                and r.get("mean_step_ms") is not None]
         if not rows:
             continue
         rows.sort(key=lambda r: (str(r.get("points")), r["config"]))
