@@ -12,3 +12,8 @@ jobs:
         with: {python-version: "${{ matrix.python-version }}"}
       - run: pip install numpy psutil matplotlib pytest
       - run: python -m pytest -q
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f docker/contract.Dockerfile -t tpprof-contract . && docker run --rm tpprof-contract
