@@ -5,6 +5,7 @@ import http.server
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -258,8 +259,33 @@ def test_sync_to_box_rsyncs_repo_with_brief_argv(tmp_path):
     assert argv[7] == "ssh -p 10341"
     assert argv[-2:] == ["./", "root@203.0.113.7:/workspace/vllm-tp2-profiling/"]
     # A re-sync must never delete run records the box has produced under results/.
-    assert "protect /results/" in argv
+    i = argv.index("--filter")
+    assert argv[i + 1] == "protect /results/***"
     assert "Liger" in proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="needs a real rsync")
+def test_sync_to_box_filters_keep_box_results_on_resync(tmp_path):
+    # Replay the script's rsync argv with a real rsync into a local "box" directory. The source has a
+    # results/ directory holding only the excluded results/dryrun, which is the case where an anchored
+    # "/results/" protect rule lets GNU rsync delete the box's run records.
+    env, _home, log = _fake_rsync_env(tmp_path)
+    proc = subprocess.run(["bash", str(SCRIPTS / "sync_to_box.sh"), "203.0.113.7", "10341"],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    argv = _rsync_calls(log)[0]["argv"]
+    e = argv.index("-e")
+    options = argv[:e] + argv[e + 2:-2]
+    src, box = tmp_path / "src", tmp_path / "box"
+    for rel, text in [("tpprof/m.py", "new"), ("results/dryrun/x.json", "dry"), (".venv/pyvenv.cfg", "v")]:
+        (src / rel).parent.mkdir(parents=True, exist_ok=True)
+        (src / rel).write_text(text)
+    for rel in ["results/raw/r1/done.json", "results/p0.log", "stale.txt"]:
+        (box / rel).parent.mkdir(parents=True, exist_ok=True)
+        (box / rel).write_text("box")
+    subprocess.run(["rsync", *options, "./", f"{box}/"], cwd=src, check=True, capture_output=True, timeout=60)
+    kept = sorted(str(q.relative_to(box)) for q in box.rglob("*") if q.is_file())
+    assert kept == ["results/p0.log", "results/raw/r1/done.json", "tpprof/m.py"]
 
 
 def test_sync_to_box_also_copies_triton_fa2_forward_when_present(tmp_path):

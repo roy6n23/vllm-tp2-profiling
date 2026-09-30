@@ -12,10 +12,16 @@ PORT=$2
 
 cd "$(dirname "$0")/.."
 
-# --delete keeps the box copy identical to this checkout, but the box's results/ holds the run records
-# of paid GPU time and has no local counterpart: protect it so a mid-rental re-sync cannot delete it.
+# The rsync command is the brief's, plus one protect rule. --delete keeps the box copy identical to this
+# checkout, but the box's results/ holds the run records of paid GPU time, which this checkout may lack.
+# The receiver (the box) decides each deletion by matching the extraneous path against the filters.
+# "/results/***" matches the results directory and every path below it, so nothing under results/ is
+# ever deleted. "/results/" alone matches only the directory entry: whenever this checkout has a
+# results/ directory (even one holding only the excluded results/dryrun), GNU rsync recurses into it
+# and deletes the box's results/raw/... files. Checked with Mac openrsync -> GNU rsync 3.5.0.
+# Protect only stops deletion: files that also exist here are still sent and overwrite the box copy.
 rsync -az --delete --exclude .venv --exclude results/dryrun -e "ssh -p $PORT" \
-    --filter "protect /results/" \
+    --filter "protect /results/***" \
     ./ "root@$HOST:/workspace/vllm-tp2-profiling/"
 echo "synced $(pwd) -> root@$HOST:/workspace/vllm-tp2-profiling/"
 

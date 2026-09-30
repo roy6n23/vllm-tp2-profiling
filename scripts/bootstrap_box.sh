@@ -11,7 +11,9 @@ ENV_FILE=/workspace/tpprof.env
 NCCL_SCRIPT=/workspace/nccl-tests.sh
 NCCL_LOG=/workspace/nccl-tests-build.log
 NCCL_PID=/workspace/nccl-tests-build.pid
-# The vLLM image installs python3 only (no `python` alias).
+# The brief and AM27 write `python -m tpprof ...`, but the vLLM image has no `python` command: its runtime
+# stage links only /usr/bin/python3 (vLLM v0.30.0 docker/Dockerfile:786-788, base nvidia/cuda ubuntu).
+# So every Python step here runs "$PY", python3 unless PY is set.
 PY=${PY:-python3}
 
 step() { printf '\n==> [%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
