@@ -4,7 +4,14 @@
   torchrun --nproc-per-node N [--master-port P] -m tpprof.comm_bench ARGS  -> python -m tpprof.comm_bench --synthetic ARGS
   torchrun --nproc-per-node N [--master-port P] -m tpprof.vendored m1|m2 ARGS -> python -m tpprof.vendored m1|m2 ARGS --synthetic
 
-Anything else exits 2. The child runs under this interpreter (sys.executable), like the real torchrun.
+Anything else exits 2.
+
+Interpreter: the real torchrun runs the child under its own sys.executable, which is the python of the
+environment torch and tpprof are installed in. This fake's own interpreter is whatever `python3` is first
+on PATH (shebang `#!/usr/bin/env python3`), which may lack tpprof's runtime dependencies (numpy): on a
+Mac, Homebrew python3 comes before the project venv. So the child runs under FAKE_TORCHRUN_PYTHON when
+set, else under this interpreter. Callers that need tpprof's environment set
+FAKE_TORCHRUN_PYTHON=sys.executable, or put dirname(sys.executable) on PATH right after tests/fake_bin.
 """
 from __future__ import annotations
 
@@ -26,10 +33,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("args", nargs=argparse.REMAINDER)
     ns = parser.parse_args(argv)
 
+    python = os.environ.get("FAKE_TORCHRUN_PYTHON") or sys.executable
     if ns.module and ns.target == "tpprof.comm_bench":
-        cmd = [sys.executable, "-m", ns.target, "--synthetic", *ns.args]
+        cmd = [python, "-m", ns.target, "--synthetic", *ns.args]
     elif ns.module and ns.target == "tpprof.vendored" and ns.args[:1] in (["m1"], ["m2"]):
-        cmd = [sys.executable, "-m", ns.target, *ns.args, "--synthetic"]
+        cmd = [python, "-m", ns.target, *ns.args, "--synthetic"]
     else:
         what = ("-m " if ns.module else "") + " ".join([ns.target, *ns.args])
         sys.stderr.write(f"fake torchrun: unsupported target: {what}\n"

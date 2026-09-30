@@ -44,6 +44,18 @@ def env_bool01(name: str, default: str) -> bool:
     return bool(int(os.environ.get(name, default)))
 
 
+def log_stats_interval() -> float:
+    """Seconds between periodic stats lines: vLLM's VLLM_LOG_STATS_INTERVAL (default 10.0, values <= 0 -> 10.0).
+
+    A real wall-clock interval, like `nvidia-smi -lms`, so FAKE_TIME_SCALE does not apply (vllm/envs.py:846-850).
+    """
+    try:
+        value = float(os.environ.get("VLLM_LOG_STATS_INTERVAL", "10."))
+    except ValueError:
+        return 10.0
+    return value if value > 0.0 else 10.0
+
+
 def visible_gpus(default_count: int) -> list[int]:
     """Physical GPU indices from CUDA_VISIBLE_DEVICES, else 0..default_count-1."""
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")

@@ -8,14 +8,17 @@ import os
 import pathlib
 import re
 import resource
+import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
 
 from tests.conftest import FAKE_BIN, FIXTURES, fake_env
+from tests.fakes import common
 
 VLLM = str(FAKE_BIN / "vllm")
 NVSMI = str(FAKE_BIN / "nvidia-smi")
@@ -282,6 +285,23 @@ def test_serve_health_stream_metrics_and_clean_sigint(tmp_path):
     assert "Application startup complete." in messages(log.read_text())
 
 
+@pytest.mark.parametrize("pc_flag,queries,hits", [
+    # D5: no lookup runs with --no-enable-prefix-caching, so both counters stay 0 (hit rate 0/0 on the box).
+    ("--no-enable-prefix-caching", 0, 0),
+    # Lookup runs: every prompt token is queried; the repeated prompt hits its full blocks.
+    ("--enable-prefix-caching", 2 * 1024, 1024),
+])
+def test_serve_prefix_cache_counters_follow_the_flag(tmp_path, pc_flag, queries, hits):
+    with fake_server(tmp_path, [pc_flag], fake_env(tmp_path)) as (_proc, port, _log):
+        for _ in range(2):
+            sse_messages(port, completion_body(2))
+        metrics = http_body(port, "/metrics")
+    labels = {"engine": "0", "model_name": "/m"}
+    assert metric_value(metrics, "vllm:prefix_cache_queries_total", **labels) == queries
+    assert metric_value(metrics, "vllm:prefix_cache_hits_total", **labels) == hits
+    assert metric_value(metrics, "vllm:prompt_tokens_total", **labels) == 2 * 1024
+
+
 def test_serve_rejects_unknown_model_like_the_real_server(tmp_path):
     with fake_server(tmp_path, ["--served-model-name", SERVED], fake_env(tmp_path)) as (_proc, port, _log):
         assert http_status(port, "POST", "/v1/completions", completion_body(2, model="other")) == 404
@@ -420,8 +440,8 @@ def test_g2_enforce_eager_logs_eager_and_no_graphs_or_fusion(tmp_path):
 
 
 def test_dp2_two_engines_two_kv_lines_and_periodic_stats(tmp_path):
-    with fake_server(tmp_path, engine_flags("DP2") + SERVE_ONLY + SERVE_TAIL, arm_env(tmp_path, "DP2")) as (
-            proc, _port, log):
+    env = arm_env(tmp_path, "DP2", VLLM_LOG_STATS_INTERVAL="0.2")
+    with fake_server(tmp_path, engine_flags("DP2") + SERVE_ONLY + SERVE_TAIL, env) as (proc, _port, log):
         assert state_files(tmp_path) == ["gpu0.json", "gpu1.json"]
         deadline = time.monotonic() + 5
         while "Engine 001: Avg prompt throughput" not in log.read_text() and time.monotonic() < deadline:
@@ -436,6 +456,26 @@ def test_dp2_two_engines_two_kv_lines_and_periodic_stats(tmp_path):
     assert re.fullmatch(r"Engine 000: Avg prompt throughput: \d+\.\d tokens/s, Avg generation throughput: "
                         r"\d+\.\d tokens/s, Running: \d+ reqs, Waiting: \d+ reqs, GPU KV cache usage: "
                         r"\d+\.\d%, Prefix cache hit rate: \d+\.\d%", stats[0].group("msg"))
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, 10.0), ("0.2", 0.2), ("30", 30.0), ("0", 10.0), ("-1", 10.0),
+])
+def test_stats_interval_is_vllm_log_stats_interval(monkeypatch, value, expected):
+    """C6 / D5-20: every VLLM_LOG_STATS_INTERVAL s (default 10.0; <= 0 falls back to 10), not scaled."""
+    monkeypatch.setenv("FAKE_TIME_SCALE", "0.01")
+    if value is None:
+        monkeypatch.delenv("VLLM_LOG_STATS_INTERVAL", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_LOG_STATS_INTERVAL", value)
+    assert common.log_stats_interval() == expected
+
+
+def test_serve_default_stats_cadence_is_not_one_second(tmp_path):
+    with fake_server(tmp_path, [], fake_env(tmp_path)) as (proc, _port, log):
+        time.sleep(1.5)
+        assert stop(proc) == 0
+    assert not lines_with(log.read_text(), "Avg prompt throughput")
 
 
 # ---------------------------------------------------------------- (d) logparse on fake TP2 logs
@@ -693,6 +733,10 @@ def stub_tpprof(tmp_path: pathlib.Path) -> pathlib.Path:
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("")
     rec = ("import json, os, sys\n"
+           "import importlib.util\n"
+           "with open(os.environ['STUB_EXE'], 'a') as f:\n"
+           "    f.write(json.dumps({'exe': sys.executable,\n"
+           "                        'numpy': importlib.util.find_spec('numpy') is not None}) + '\\n')\n"
            "with open(os.environ['STUB_OUT'], 'a') as f:\n"
            "    f.write(json.dumps({'mod': __name__, 'argv': sys.argv[1:], 'rank': os.environ.get('RANK'),\n"
            "                        'world': os.environ.get('WORLD_SIZE')}) + '\\n')\n")
@@ -701,10 +745,11 @@ def stub_tpprof(tmp_path: pathlib.Path) -> pathlib.Path:
     return root
 
 
-def run_torchrun(tmp_path: pathlib.Path, *args: str) -> tuple[subprocess.CompletedProcess, list[dict]]:
+def run_torchrun(tmp_path: pathlib.Path, *args: str, **extra_env: str) -> tuple[subprocess.CompletedProcess,
+                                                                              list[dict]]:
     stub = stub_tpprof(tmp_path)
     out_file = tmp_path / "calls.jsonl"
-    env = fake_env(tmp_path, STUB_OUT=str(out_file))
+    env = fake_env(tmp_path, STUB_OUT=str(out_file), STUB_EXE=str(tmp_path / "exe.jsonl"), **extra_env)
     env["PYTHONPATH"] = os.pathsep.join([str(stub), env["PYTHONPATH"]])
     out = subprocess.run([TORCHRUN, *args], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
     calls = [json.loads(line) for line in out_file.read_text().splitlines()] if out_file.exists() else []
@@ -724,6 +769,22 @@ def test_torchrun_vendored_runs_synthetic_once(tmp_path, which):
     out, calls = run_torchrun(tmp_path, "--nproc-per-node", "2", "-m", "tpprof.vendored", which, "--out", "x")
     assert out.returncode == 0, out.stderr
     assert [c["argv"] for c in calls] == [[which, "--out", "x", "--synthetic"]]
+
+
+def test_torchrun_child_interpreter_defaults_to_its_own_and_honors_override(tmp_path):
+    args = ("--nproc-per-node", "2", "-m", "tpprof.comm_bench", "--out", "m3.jsonl")
+    own = shutil.which("python3", path=fake_env(tmp_path)["PATH"])
+    out, _ = run_torchrun(tmp_path, *args)
+    assert out.returncode == 0, out.stderr
+    default = json.loads((tmp_path / "exe.jsonl").read_text())
+    assert os.path.realpath(default["exe"]) == os.path.realpath(own)
+
+    # tpprof's own interpreter (the venv, with numpy) even when PATH's python3 lacks numpy (Homebrew on the Mac).
+    (tmp_path / "exe.jsonl").unlink()
+    shutil.rmtree(tmp_path / "stub")
+    out, _ = run_torchrun(tmp_path, *args, FAKE_TORCHRUN_PYTHON=sys.executable)
+    assert out.returncode == 0, out.stderr
+    assert json.loads((tmp_path / "exe.jsonl").read_text()) == {"exe": sys.executable, "numpy": True}
 
 
 @pytest.mark.parametrize("args", [

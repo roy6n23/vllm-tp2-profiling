@@ -84,6 +84,7 @@ class Log:
 def serve_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vllm serve", allow_abbrev=False)
     p.add_argument("model_tag", nargs="?", default="Qwen/Qwen3-0.6B")
+    p.add_argument("--host", default=None)  # parsed like the real CLI; the fake always binds 127.0.0.1
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     p.add_argument("--data-parallel-size", "-dp", type=int, default=1)
@@ -309,9 +310,12 @@ class ServeState:
             e.kv_used += n_prompt
             e.prompt_tokens += n_prompt
             e.window_prompt += n_prompt
-            e.pc_queries += n_prompt
-            if self.cfg.prefix_caching and prompt in self.seen_prompts:
-                e.pc_hits += (n_prompt // 16) * 16
+            # vLLM records prefix-cache stats only when a lookup runs (kv_cache_manager.py:250-263,
+            # prefix_cache_lookup_enabled): with --no-enable-prefix-caching both counters stay 0.
+            if self.cfg.prefix_caching:
+                e.pc_queries += n_prompt
+                if prompt in self.seen_prompts:
+                    e.pc_hits += (n_prompt // 16) * 16
             self.seen_prompts.add(prompt)
             return idx
 
@@ -627,7 +631,8 @@ def serve_main(argv: list[str]) -> int:
         log.uvicorn("Waiting for application startup.")
         log.uvicorn("Application startup complete.")
         last = time.monotonic()
-        while not stop.wait(1.0):
+        interval = common.log_stats_interval()
+        while not stop.wait(interval):
             now = time.monotonic()
             if cfg.api_servers == 1:
                 state.stats_lines(now - last)
