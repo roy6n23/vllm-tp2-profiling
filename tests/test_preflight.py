@@ -223,6 +223,23 @@ def test_full_checks_off_box_with_fakes(tmp_path, roomy, monkeypatch):
         assert name not in by
 
 
+def test_pinned_thresholds_come_from_constants(tmp_path, roomy, monkeypatch):
+    for name in ("EXPECTED_LINK", "MIN_CPUS", "MIN_RAM_BYTES", "FLASHINFER_JIT_CACHE"):
+        assert not hasattr(preflight, name), f"{name} must live only in tpprof/constants.py"
+    dist, want = constants.FLASHINFER_JIT_CACHE
+    installed = {dist: want}
+    monkeypatch.setattr(preflight.importlib.metadata, "version", lambda d: installed[d])
+    by = _by_name(preflight.full_checks(_ctx(tmp_path)))
+    assert by["flashinfer_jit_cache"].ok and want in by["flashinfer_jit_cache"].detail
+    installed[dist] = "0.6.17"
+    by = _by_name(preflight.full_checks(_ctx(tmp_path)))
+    assert not by["flashinfer_jit_cache"].ok and "0.6.17" in by["flashinfer_jit_cache"].detail
+    assert f"{dist}=={want}" in by["flashinfer_jit_cache"].fix
+    monkeypatch.setattr(constants, "MIN_CPUS", 10**6)
+    by = _by_name(preflight.quick_checks(_ctx(tmp_path)))
+    assert not by["cpus"].ok and str(10**6) in by["cpus"].detail
+
+
 def test_vllm_version_mismatch_fails(tmp_path, roomy):
     fake = tmp_path / "vllm"
     fake.write_text("#!/bin/sh\necho 0.29.1\n")
@@ -268,6 +285,38 @@ def test_skip_gate_recorded(tmp_path, roomy):
     gpu_idle = next(c for c in report["checks"] if c["name"] == "gpu_idle")
     assert gpu_idle["ok"] is False and gpu_idle["skipped"] is True
     assert set(gpu_idle) == {"name", "ok", "hard", "detail", "fix", "skipped"}
+
+
+def test_skip_gate_from_context_reaches_verdict_and_report(tmp_path, roomy):
+    """A caller that sets ctx.skip_gates and uses the brief's signatures gets one consistent answer."""
+    checks = preflight.quick_checks(_ctx(tmp_path, "busy", skip_gates=("gpu_idle", "shm")))
+    by = _by_name(checks)
+    assert by["gpu_idle"].skipped and not by["gpu_idle"].ok   # recorded, not hidden
+    assert not by["shm"].skipped                              # it passed: nothing to override
+    ok, text = preflight.verdict(checks)
+    assert ok and "SKIP  gpu_idle" in text and "skipped gates: gpu_idle" in text
+    out = tmp_path / "preflight.json"
+    preflight.write_report(checks, str(out))
+    report = json.loads(out.read_text())
+    assert report["ok"] is True and report["skipped_gates"] == ["gpu_idle"]
+    gpu_idle = next(c for c in report["checks"] if c["name"] == "gpu_idle")
+    assert gpu_idle["ok"] is False and gpu_idle["skipped"] is True
+    # passing the same names again changes nothing
+    assert preflight.verdict(checks, ctx_skip := ("gpu_idle",)) == (ok, text)
+    preflight.write_report(checks, str(out), skip=ctx_skip)
+    assert json.loads(out.read_text())["skipped_gates"] == ["gpu_idle"]
+
+
+def test_skip_gate_from_context_in_full_checks(tmp_path, roomy, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name, path=None: None)   # no nvcc, whatever the host
+    ctx = _ctx(tmp_path, model_dir=str(_model_dir(tmp_path)), skip_gates=("nvcc",))
+    by = _by_name(preflight.full_checks(ctx))
+    assert not by["nvcc"].ok and by["nvcc"].skipped
+    assert not by["gpu_idle"].skipped
+    _, text = preflight.verdict(list(by.values()))
+    summary = text.splitlines()[-1]
+    assert "SKIP  nvcc" in text and "skipped gates: nvcc" in summary
+    assert "nvcc" not in summary.split(", skipped gates:")[0]
 
 
 def test_write_report_without_skips_fails_on_hard_gate(tmp_path, roomy):

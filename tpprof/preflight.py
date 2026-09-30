@@ -26,10 +26,6 @@ from tpprof import constants, engine, helpflags
 NVIDIA_SMI_TIMEOUT_S = 30
 VLLM_TIMEOUT_S = 180            # the real CLI imports torch before printing anything
 TOOL_TIMEOUT_S = 60
-EXPECTED_LINK = "NV18"
-MIN_CPUS = 16
-MIN_RAM_BYTES = 128 * 10**9
-FLASHINFER_JIT_CACHE = ("flashinfer-jit-cache", "0.6.18.post1")   # what the pinned image installs
 GPU_QUERY = ("--query-gpu=index,name,driver_version,memory.total,memory.used,power.limit,pci.bus_id",
              "--format=csv,noheader,nounits")
 APPS_QUERY = ("--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits")
@@ -46,32 +42,35 @@ FIXES: dict[str, str] = {
     "gpu_count": "Exactly 2 GPUs must be visible (check CUDA_VISIBLE_DEVICES). " + _TERMINATE,
     "gpu_name": f"Both GPUs must be {constants.H100_SXM.name} (H100 SXM). " + _TERMINATE,
     "power_limit": f"A power limit below {constants.H100_SXM.power_limit_w} W shifts every number. " + _TERMINATE,
-    "driver": f"The image needs driver >= {constants.MIN_DRIVER_MAJOR} (CUDA 13.0); set allowedCudaVersions "
-              "[\"13.0\"] on the pod. " + _TERMINATE,
-    "topology": f"GPU0 and GPU1 must be joined by {EXPECTED_LINK}. " + _TERMINATE
-                + " Only if no NV18 host exists: rerun with --accept-topology and note it in the README.",
+    "driver": f"The image needs driver >= {constants.MIN_DRIVER_MAJOR} (CUDA {constants.TORCH_CUDA}); set "
+              f"allowedCudaVersions [\"{constants.TORCH_CUDA}\"] on the pod. " + _TERMINATE,
+    "topology": f"GPU0 and GPU1 must be joined by {constants.EXPECTED_LINK}. " + _TERMINATE
+                + f" Only if no {constants.EXPECTED_LINK} host exists: rerun with --accept-topology and note it "
+                  "in the README.",
     "fabric": "The NVLink fabric is not registered (fabric manager). Wait a minute and retry; "
               "if it stays so, " + _TERMINATE,
     "gpu_idle": "Stop the foreign GPU processes (nvidia-smi --query-compute-apps=pid,used_memory) "
-                "and wait until memory.used < 1 GiB, or pick another host.",
-    "shm": "/dev/shm needs >= 1 GiB free for TP2: start the container with --ipc=host or a larger --shm-size.",
-    "disk": "Needs >= 60 GB free under the results directory (model, compile cache, traces): "
-            "free space or attach a larger volume.",
-    "nofile": "Raise the hard open-files limit to >= 8192 (`ulimit -Hn 65535` as root, or "
-              "docker --ulimit nofile=65535:65535).",
-    "cpus": "Fewer than 16 CPUs can make the API server or the client the bottleneck; "
+                f"and wait until memory.used < {constants.GPU_FREE_MIB} MiB, or pick another host.",
+    "shm": f"/dev/shm needs >= {constants.MIN_SHM_BYTES / 2**30:g} GiB free for TP2: start the container "
+           "with --ipc=host or a larger --shm-size.",
+    "disk": f"Needs >= {constants.MIN_DISK_BYTES / 1e9:g} GB free under the results directory "
+            "(model, compile cache, traces): free space or attach a larger volume.",
+    "nofile": f"Raise the hard open-files limit to >= {constants.MIN_NOFILE_HARD} (`ulimit -Hn 65535` as "
+              "root, or docker --ulimit nofile=65535:65535).",
+    "cpus": f"Fewer than {constants.MIN_CPUS} CPUs can make the API server or the client the bottleneck; "
             "check the CPU columns of the saturation runs.",
-    "ram": "Less than 128 GB RAM: model loading and page cache may be slow; watch for swapping.",
+    "ram": f"Less than {constants.MIN_RAM_BYTES / 1e9:g} GB RAM: model loading and page cache may be slow; "
+           "watch for swapping.",
     "vllm_version": _IMAGE,
     "help_flags": "A generated argv uses a flag this vLLM does not know: fix tpprof/engine.py or "
                   "tpprof/client.py, or confirm the vLLM version.",
     "torch": _IMAGE + f" It ships torch {constants.TORCH_VERSION} built for CUDA {constants.TORCH_CUDA}; "
-                      "an SM count other than 132 means the GPU is not an H100 SXM.",
+                      f"an SM count other than {constants.H100_SXM.sm_count} means the GPU is not an H100 SXM.",
     "vllm_env_names": "Unset the unknown VLLM_* variables: --fail-on-environ-validation makes vLLM refuse "
                       "to start with them.",
     "json_configs": "Fix the JSON config in tpprof/engine.py; vLLM rejects it.",
     "nvcc": _IMAGE + " Without nvcc FlashInfer cannot JIT and the allreduce fusion is silently off.",
-    "flashinfer_jit_cache": _IMAGE + f" It ships {FLASHINFER_JIT_CACHE[0]}=={FLASHINFER_JIT_CACHE[1]}.",
+    "flashinfer_jit_cache": _IMAGE + " It ships {}=={}.".format(*constants.FLASHINFER_JIT_CACHE),
     "model_files": f"Download {constants.MODEL.repo}@{constants.MODEL.revision} again into the model dir "
                    "(scripts/bootstrap_box.sh); a partial or wrong snapshot changes the model.",
     "model_volume": "The model is on a network volume: startup and page-cache warmup are slower. "
@@ -94,6 +93,7 @@ class Check:
     hard: bool
     detail: str
     fix: str
+    skipped: bool = False    # a failed hard gate overridden by --skip-gate (set from ctx.skip_gates)
 
 
 @dataclass
@@ -105,7 +105,7 @@ class PreflightContext:
     shm_path: str = "/dev/shm"
     on_box: bool = True
     accept_topology: bool = False
-    skip_gates: tuple[str, ...] = ()
+    skip_gates: tuple[str, ...] = ()     # --skip-gate names; quick/full_checks mark those gates `skipped`
     env: Mapping[str, str] | None = None
 
 
@@ -237,9 +237,9 @@ def _topology(ctx: PreflightContext) -> Check:
     link = topology_link(out)
     if link is None:
         return _check("topology", False, "no GPU0-GPU1 cell in nvidia-smi topo -m")
-    if link == EXPECTED_LINK:
+    if link == constants.EXPECTED_LINK:
         return _check("topology", True, f"GPU0-GPU1 link {link}")
-    detail = f"GPU0-GPU1 link {link}, expected {EXPECTED_LINK}"
+    detail = f"GPU0-GPU1 link {link}, expected {constants.EXPECTED_LINK}"
     if ctx.accept_topology:
         return _check("topology", False, detail + "; accepted by --accept-topology (recorded)", hard=False)
     return _check("topology", False, detail)
@@ -334,18 +334,19 @@ def _nofile() -> Check:
 
 def _cpus() -> Check:
     n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 0)
-    return _check("cpus", n >= MIN_CPUS, f"{n} CPUs usable (want >= {MIN_CPUS})")
+    return _check("cpus", n >= constants.MIN_CPUS, f"{n} CPUs usable (want >= {constants.MIN_CPUS})")
 
 
 def _ram() -> Check:
     total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    return _check("ram", total >= MIN_RAM_BYTES, f"{total / 1e9:.1f} GB RAM (want >= {MIN_RAM_BYTES / 1e9:.0f} GB)")
+    want = constants.MIN_RAM_BYTES
+    return _check("ram", total >= want, f"{total / 1e9:.1f} GB RAM (want >= {want / 1e9:.0f} GB)")
 
 
 def quick_checks(ctx: PreflightContext) -> list[Check]:
     """AM27: standard library and nvidia-smi only; runs in seconds, before any download."""
     gpus, err = query_gpus(ctx)
-    return [
+    return _apply_skips(ctx, [
         _guarded("gpu_count", _gpu_count, gpus, err),
         _guarded("gpu_name", _gpu_name, gpus, err),
         _guarded("power_limit", _power_limit, gpus, err),
@@ -358,7 +359,7 @@ def quick_checks(ctx: PreflightContext) -> list[Check]:
         _guarded("nofile", _nofile),
         _guarded("cpus", _cpus),
         _guarded("ram", _ram),
-    ]
+    ])
 
 
 # ================================================================ full checks
@@ -483,7 +484,7 @@ def _nvcc(ctx: PreflightContext) -> Check:
 
 
 def _flashinfer_jit_cache() -> Check:
-    dist, want = FLASHINFER_JIT_CACHE
+    dist, want = constants.FLASHINFER_JIT_CACHE
     try:
         got = importlib.metadata.version(dist)
     except importlib.metadata.PackageNotFoundError:
@@ -644,10 +645,24 @@ def full_checks(ctx: PreflightContext) -> list[Check]:
         ("multicast", _multicast, (), box),
         ("imports", _imports, (ctx,), True),
     ]
-    return quick_checks(ctx) + [_guarded(name, fn, *args) for name, fn, args, run in plan if run]
+    full = [_guarded(name, fn, *args) for name, fn, args, run in plan if run]
+    return _apply_skips(ctx, quick_checks(ctx) + full)
 
 
 # ================================================================ verdict and report
+
+
+def _apply_skips(ctx: PreflightContext, checks: list[Check]) -> list[Check]:
+    """Mark the failed hard gates named in `ctx.skip_gates`, so verdict() and write_report() agree without
+    being handed the names again. The raw `ok` stays False: the override is recorded, not hidden."""
+    for c in checks:
+        c.skipped = c.skipped or (c.hard and not c.ok and c.name in ctx.skip_gates)
+    return checks
+
+
+def _skip_names(checks: Sequence[Check], skip: Sequence[str]) -> tuple[str, ...]:
+    """The explicit `skip` names plus every check already marked `skipped` via ctx.skip_gates."""
+    return tuple(dict.fromkeys([*skip, *(c.name for c in checks if c.skipped)]))
 
 
 def _skipped(c: Check, skip: Sequence[str]) -> bool:
@@ -655,7 +670,9 @@ def _skipped(c: Check, skip: Sequence[str]) -> bool:
 
 
 def verdict(checks: Sequence[Check], skip: Sequence[str] = ()) -> tuple[bool, str]:
-    """(ok, a table of every check); failed hard gates named in `skip` are overridden and marked SKIP."""
+    """(ok, a table of every check). A failed hard gate is overridden and shown as SKIP when it is marked
+    `skipped` (ctx.skip_gates) or named in `skip`."""
+    skip = _skip_names(checks, skip)
     rows = []
     for c in checks:
         status = "PASS" if c.ok else "SKIP" if _skipped(c, skip) else "FAIL" if c.hard else "WARN"
@@ -686,13 +703,18 @@ def verdict(checks: Sequence[Check], skip: Sequence[str] = ()) -> tuple[bool, st
 
 
 def write_report(checks: Sequence[Check], path: str, skip: Sequence[str] = ()) -> None:
-    """preflight.json: the verdict, the requested --skip-gate names, and every check."""
+    """preflight.json: the verdict, the --skip-gate names, and every check.
+
+    The skipped gates come from the checks themselves (marked from ctx.skip_gates), so
+    `write_report(checks, path)` agrees with `verdict(checks)`; the optional `skip` adds names, as in verdict().
+    """
+    skip = _skip_names(checks, skip)
     ok, _ = verdict(checks, skip)
     report = {
         "ok": ok,
         "t_wall": time.time(),
         "t_mono": time.monotonic(),
-        "skipped_gates": list(dict.fromkeys(skip)),
+        "skipped_gates": list(skip),
         "checks": [{**dataclasses.asdict(c), "skipped": _skipped(c, skip)} for c in checks],
     }
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
