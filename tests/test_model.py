@@ -99,3 +99,62 @@ def test_rejects_unknown_tp_ar_path_and_config():
         m.decode_step_time(2, 1, 1024, D8, ar_path="nccl")
     with pytest.raises(ValueError, match="config"):
         m.running_limit("DP4", D8)
+
+@pytest.mark.parametrize("config,tp,batch", [("TP1", 1, 1), ("TP1", 1, 4), ("TP1", 1, 64), ("TP1", 1, 330),
+                                             ("TP2", 2, 1), ("TP2", 2, 4), ("TP2", 2, 64), ("TP2", 2, 512)])
+def test_saturation_matches_sat_py_including_memory_bound_steps(config, tp, batch):
+    # Small batches make sat.py's step memory-bound, so its 15.01e9 / tp weight literal is exercised.
+    d8s = _run_d8_script("sat.py")
+    _, tps = d8s["step"](m.running_limit(config, D8, max_num_seqs=batch), tp)   # TP1 is KV-bound at 328
+    assert m.saturation_output_tps(config, D8, max_num_seqs=batch) == pytest.approx(tps, rel=1e-12)
+
+
+def _floats(obj):
+    if isinstance(obj, float):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _floats(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _floats(v)
+
+
+def test_predictions_floats_have_at_most_4_significant_digits():
+    p = m.predictions()
+    outputs = [x for k, v in p.items() if k != "constants" for x in _floats(v)]
+    assert outputs
+    for x in outputs:
+        assert float(f"{x:.4g}") == x, x
+    # Constants are inputs and are reported verbatim; every one already has at most 4 significant digits.
+    for x in _floats(p["constants"]):
+        assert float(f"{x:.4g}") == x, x
+
+
+def test_predictions_h2_has_a_prefill_leg():
+    p = m.predictions()
+    c = m.CONSTANTS["central"]
+
+    def e(n: int) -> float:
+        return m.prefill_time(1, n, c) / m.prefill_time(2, n, c) / 2
+
+    lo, hi = p["bands"]["H2_prefill"]
+    assert lo <= hi
+    assert p["hypotheses_central"]["H2_prefill"] == pytest.approx(e(8192) - e(512), rel=1e-3)
+    assert lo <= p["hypotheses_central"]["H2_prefill"] <= hi
+
+
+def test_predictions_central_values_lie_in_their_bands():
+    p = m.predictions()
+    assert set(p["hypotheses_central"]) == set(p["bands"])
+    for h, (lo, hi) in p["bands"].items():
+        assert lo <= p["hypotheses_central"][h] <= hi, h
+
+
+def test_predictions_ratios_are_computed_before_rounding():
+    p, c = m.predictions(), m.CONSTANTS["central"]
+    full = m.decode_step_time(1, 1, 1216, c) / m.decode_step_time(2, 1, 1216, c)
+    assert p["ratios"]["decode_speedup"]["central"]["1"] == float(f"{full:.4g}")
+    assert p["ratios"]["decode_speedup"]["central"]["1"] == p["hypotheses_central"]["H1"]
+    assert p["ratios"]["dp2_over_tp2_saturation"]["central"] == p["hypotheses_central"]["H3"]
+    assert set(p["ratios"]["prefill_speedup"]["central"]) == set(p["prefill"]["central"]["1"])

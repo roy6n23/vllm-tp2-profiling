@@ -7,14 +7,17 @@ import pathlib
 from tpprof import model
 
 SETS = ("central", "optimistic", "pessimistic")
-HYPOTHESES = (
-    ("H1", "TP2 decode step speedup over TP1 at batch 1, context 1216", "ratio"),
-    ("H2", "Rise in TP2 decode scaling efficiency e = speedup / 2 from batch 1 to batch 128: e(128) - e(1)",
+HYPOTHESES = (          # (row label, predictions() band key, statement, kind)
+    ("H1", "H1", "TP2 decode step speedup over TP1 at batch 1, context 1216", "ratio"),
+    ("H2", "H2", "Rise in TP2 decode scaling efficiency e = speedup / 2 from batch 1 to batch 128: e(128) - e(1)",
      "ratio"),
-    ("H3", "DP2 / TP2 saturation output throughput (1024 in / 256 out, no-preemption bound)", "ratio"),
-    ("H4", "Goodput crossover s* (TPOT SLO, ms; TTFT SLO 1 s): TP2 wins below it, DP2 above", "ms"),
-    ("H5", "TP2 / TP1 KV cache capacity, tokens per engine", "ratio"),
-    ("H8", "AR3 (pure NCCL, unfused residual+RMSNorm) / default fused path, TP2 decode step at batch 1",
+    ("H2 (prefill)", "H2_prefill",
+     "Rise in TP2 prefill scaling efficiency e = speedup / 2 from 512 to 8192 prompt tokens: e(8192) - e(512)",
+     "ratio"),
+    ("H3", "H3", "DP2 / TP2 saturation output throughput (1024 in / 256 out, no-preemption bound)", "ratio"),
+    ("H4", "H4", "Goodput crossover s* (TPOT SLO, ms; TTFT SLO 1 s): TP2 wins below it, DP2 above", "ms"),
+    ("H5", "H5", "TP2 / TP1 KV cache capacity, tokens per engine", "ratio"),
+    ("H8", "H8", "AR3 (pure NCCL, unfused residual+RMSNorm) / default fused path, TP2 decode step at batch 1",
      "ratio"),
 )
 CONSTANT_UNITS = {
@@ -27,7 +30,10 @@ CONSTANT_UNITS = {
 
 
 def _ms(x: float) -> str:
-    return f"{x:.2f}"
+    """Two decimals, as the brief asks, but never more digits than the 4 significant ones
+    predictions() keeps: 5.85 -> "5.85", 223.6 -> "223.6" (not "223.60"), 1234 -> "1234"."""
+    int_digits = len(str(int(abs(x))))
+    return f"{x:.{max(0, min(2, 4 - int_digits))}f}"
 
 
 def _count(x: float) -> str:
@@ -50,11 +56,11 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
     return lines
 
 
-def _tp_tables(section: dict, key_label: str) -> list[str]:
+def _tp_tables(section: dict, speedups: dict, key_label: str) -> list[str]:
     lines: list[str] = []
     for name in SETS:
-        tp1, tp2 = section[name]["1"], section[name]["2"]
-        rows = [[k, _ms(tp1[k]), _ms(tp2[k]), _ratio(tp1[k] / tp2[k])] for k in tp1]
+        tp1, tp2, sp = section[name]["1"], section[name]["2"], speedups[name]
+        rows = [[k, _ms(tp1[k]), _ms(tp2[k]), _ratio(sp[k])] for k in tp1]
         lines += [f"### {name}", "", *_table([key_label, "TP1", "TP2", "speedup"], rows), ""]
     return lines
 
@@ -72,20 +78,20 @@ def render_predictions_md(pred: dict) -> str:
         "",
     ]
     rows = []
-    for hid, statement, kind in HYPOTHESES:
-        band = pred["bands"][hid]
+    for label, key, statement, kind in HYPOTHESES:
+        band = pred["bands"][key]
         band_s = "none" if band is None else f"{_hyp_value(band[0], kind)}–{_hyp_value(band[1], kind)}"
-        rows.append([hid, statement, band_s, _hyp_value(pred["hypotheses_central"][hid], kind)])
+        rows.append([label, statement, band_s, _hyp_value(pred["hypotheses_central"][key], kind)])
     lines += [*_table(["id", "statement", "band (lo–hi)", "central"], rows), ""]
 
     lines += ["## Decode step time (ms, context 1216)", "",
               "Per-step decode time at mean context 1216 (1024 prompt tokens plus the mean of the 64/320 "
               "output lengths); speedup = TP1 / TP2.", ""]
-    lines += _tp_tables(pred["decode"], "batch")
+    lines += _tp_tables(pred["decode"], pred["ratios"]["decode_speedup"], "batch")
 
     lines += ["## Prefill (ms)", "",
               "Time to prefill one prompt of N tokens; speedup = TP1 / TP2.", ""]
-    lines += _tp_tables(pred["prefill"], "N")
+    lines += _tp_tables(pred["prefill"], pred["ratios"]["prefill_speedup"], "N")
 
     lines += ["## KV cache capacity (tokens per engine)", "",
               "KV cache tokens per engine at `--gpu-memory-utilization 0.90`. DP2 runs two TP1-sized engines.",
@@ -100,7 +106,7 @@ def render_predictions_md(pred: dict) -> str:
     sat_rows = []
     for n in SETS:
         s = pred["saturation_tps"][n]
-        sat_rows.append([n, _count(s["TP1"]), _count(s["TP2"]), _count(s["DP2"]), _ratio(s["DP2"] / s["TP2"])])
+        sat_rows.append([n, _count(s["TP1"]), _count(s["TP2"]), _count(s["DP2"]), _ratio(pred["ratios"]["dp2_over_tp2_saturation"][n])])
     lines += [*_table(["constants", "TP1", "TP2", "DP2", "DP2 / TP2"], sat_rows), ""]
 
     lines += ["## Constants", "",

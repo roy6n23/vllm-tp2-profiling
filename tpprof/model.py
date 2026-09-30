@@ -40,6 +40,10 @@ GOODPUT_GRID_POINTS = 200
 _FIXED_POINT_MAX_ITERS = 200
 _FIXED_POINT_TOL = 1e-9
 _BAND_SETS = ("optimistic", "central", "pessimistic")
+HYPOTHESIS_IDS = ("H1", "H2", "H2_prefill", "H3", "H4", "H5", "H8")
+# D8 sat.py step() streams a rounded 15.01e9 weight bytes at TP1 (streamed_weight_bytes(1) is 15.0098e9).
+# The saturation model keeps D8's literal so it reproduces sat.py exactly, memory-bound steps included.
+SAT_WEIGHT_BYTES_TP1 = 15.01e9
 
 
 def _check_tp(tp: int) -> None:
@@ -252,7 +256,7 @@ def _saturation_step(batch: int, tp: int, c: Constants) -> tuple[float, float]:
     tokens = batch + prefill_tokens
     sampled = batch + finished
     lin_flops = (tokens * linear_flops_per_token(False) + sampled * 2 * _lm_head_params(s)) / tp
-    t_lin = max(lin_flops / c.gemm_flops, streamed_weight_bytes(tp) / c.bw_eff)
+    t_lin = max(lin_flops / c.gemm_flops, (SAT_WEIGHT_BYTES_TP1 / tp) / c.bw_eff)
     t_att = (batch * ONLINE_MEAN_CTX * kv_bytes_per_token(tp) / c.bw_eff
              + 2 * s.layers * s.heads * s.head_dim * prefill_tokens * ONLINE_INPUT_LEN / tp / c.attn_flops)
     ew_bytes = c.ew_bytes_tp1 if tp == 1 else c.ew_bytes_tp2
@@ -349,15 +353,26 @@ def _band(values: list[float | None]) -> list[float] | None:
     return [_sig4(min(kept)), _sig4(max(kept))] if kept else None
 
 
-def _hypothesis_values(c: Constants) -> dict[str, float | None]:
-    def speedup(b: int) -> float:
-        return decode_step_time(1, b, DECODE_MEAN_CTX, c) / decode_step_time(2, b, DECODE_MEAN_CTX, c)
+def _decode_speedup(batch: int, c: Constants) -> float:
+    return decode_step_time(1, batch, DECODE_MEAN_CTX, c) / decode_step_time(2, batch, DECODE_MEAN_CTX, c)
 
-    b_max = max(DECODE_BATCHES)
+
+def _prefill_speedup(n: int, c: Constants) -> float:
+    return prefill_time(1, n, c) / prefill_time(2, n, c)
+
+
+def _dp2_over_tp2_saturation(c: Constants) -> float:
+    return saturation_output_tps("DP2", c) / saturation_output_tps("TP2", c)
+
+
+def _hypothesis_values(c: Constants) -> dict[str, float | None]:
+    b_min, b_max = min(DECODE_BATCHES), max(DECODE_BATCHES)
+    n_min, n_max = min(PREFILL_LENS), max(PREFILL_LENS)
     return {
-        "H1": speedup(1),
-        "H2": speedup(b_max) / 2 - speedup(1) / 2,
-        "H3": saturation_output_tps("DP2", c) / saturation_output_tps("TP2", c),
+        "H1": _decode_speedup(1, c),
+        "H2": _decode_speedup(b_max, c) / 2 - _decode_speedup(b_min, c) / 2,
+        "H2_prefill": _prefill_speedup(n_max, c) / 2 - _prefill_speedup(n_min, c) / 2,
+        "H3": _dp2_over_tp2_saturation(c),
         "H4": s_star(c),
         "H5": kv_capacity_tokens(2, c) / kv_capacity_tokens(1, c),
         "H8": (decode_step_time(2, 1, DECODE_MEAN_CTX, c, ar_path="nccl_unfused")
@@ -368,24 +383,38 @@ def _hypothesis_values(c: Constants) -> dict[str, float | None]:
 def predictions() -> dict:
     """Every a-priori number predictions.md reports, keyed by constant set.
 
-    decode/prefill are ms and saturation_tps is tok/s, at full precision. Bands are the min/max over
-    the optimistic, central and pessimistic sets (not d8); bands, hypotheses_central, the KV ratio
-    and s* are rounded to 4 significant digits."""
+    decode/prefill are ms, saturation_tps is tok/s, s_star_ms is ms. Every computed float is rounded
+    to 4 significant digits at the end, after all arithmetic; ratios are taken at full precision
+    first. ``constants`` holds the model inputs verbatim (each already has at most 4 significant digits).
+
+    Keys beyond the brief's schema, needed by predictions.md and T17:
+    - bands["H2_prefill"]: the prefill leg of H2 (spec 4.8, AM24), e(max prefill len) - e(min prefill len);
+      bands["H2"] stays the decode leg, e(128) - e(1).
+    - hypotheses_central: the central-set value of every band (H8 is not derivable from other keys).
+    - ratios: TP1/TP2 decode and prefill speedups and the DP2/TP2 saturation ratio per set, taken
+      before rounding so the tables agree with the hypothesis values.
+    Bands are the min/max over the optimistic, central and pessimistic sets (not d8)."""
     names = list(CONSTANTS)
     s_stars = {n: s_star(CONSTANTS[n]) for n in names}
     hyp = {n: _hypothesis_values(CONSTANTS[n]) for n in _BAND_SETS}
+    kv = {n: (kv_capacity_tokens(1, CONSTANTS[n]), kv_capacity_tokens(2, CONSTANTS[n])) for n in names}
     return {
         "constants": {n: asdict(c) for n, c in CONSTANTS.items()},
-        "decode": {n: {str(tp): {str(b): decode_step_time(tp, b, DECODE_MEAN_CTX, CONSTANTS[n]) * 1e3
+        "decode": {n: {str(tp): {str(b): _sig4(decode_step_time(tp, b, DECODE_MEAN_CTX, CONSTANTS[n]) * 1e3)
                                  for b in DECODE_BATCHES} for tp in (1, 2)} for n in names},
-        "prefill": {n: {str(tp): {str(x): prefill_time(tp, x, CONSTANTS[n]) * 1e3
+        "prefill": {n: {str(tp): {str(x): _sig4(prefill_time(tp, x, CONSTANTS[n]) * 1e3)
                                   for x in PREFILL_LENS} for tp in (1, 2)} for n in names},
-        "kv": {n: {"TP1": kv_capacity_tokens(1, CONSTANTS[n]), "TP2": kv_capacity_tokens(2, CONSTANTS[n]),
-                   "ratio": _sig4(kv_capacity_tokens(2, CONSTANTS[n]) / kv_capacity_tokens(1, CONSTANTS[n]))}
-               for n in names},
-        "saturation_tps": {n: {cfg: saturation_output_tps(cfg, CONSTANTS[n]) for cfg in ("TP1", "TP2", "DP2")}
+        "kv": {n: {"TP1": t1, "TP2": t2, "ratio": _sig4(t2 / t1)} for n, (t1, t2) in kv.items()},
+        "saturation_tps": {n: {cfg: _sig4(saturation_output_tps(cfg, CONSTANTS[n])) for cfg in ("TP1", "TP2", "DP2")}
                            for n in names},
         "s_star_ms": {n: None if v is None else _sig4(v) for n, v in s_stars.items()},
-        "bands": {h: _band([hyp[n][h] for n in _BAND_SETS]) for h in ("H1", "H2", "H3", "H4", "H5", "H8")},
+        "bands": {h: _band([hyp[n][h] for n in _BAND_SETS]) for h in HYPOTHESIS_IDS},
         "hypotheses_central": {h: None if v is None else _sig4(v) for h, v in hyp["central"].items()},
+        "ratios": {
+            "decode_speedup": {n: {str(b): _sig4(_decode_speedup(b, CONSTANTS[n])) for b in DECODE_BATCHES}
+                               for n in names},
+            "prefill_speedup": {n: {str(x): _sig4(_prefill_speedup(x, CONSTANTS[n])) for x in PREFILL_LENS}
+                                for n in names},
+            "dp2_over_tp2_saturation": {n: _sig4(_dp2_over_tp2_saturation(CONSTANTS[n])) for n in names},
+        },
     }
