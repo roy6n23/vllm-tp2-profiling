@@ -7,7 +7,9 @@ Models what the analysis depends on:
   correlationId. After the range end, `sample_tokens` launches the lm_head GEMM, the logits
   all-gather and the sampler eagerly (research D6-4, D6-21);
 - the GPU runs behind the CPU by a lag of 25-75% of a step that varies per step, so a
-  step's late kernels start on the GPU after the next range began (AM15);
+  step's late kernels start on the GPU after the next range began (AM15). The step period
+  covers the worst-case GPU time of a step plus an idle gap, so the backlog never builds up:
+  a step's first GPU event always starts before the next range does, at any step count;
 - FlashInfer all-reduce kernels overlap their predecessor by PDL_OVERLAP_NS (research D3-14);
 - rank r spin-waits SYNC_WAIT_NS longer in all-reduce ops j with j % tp == r (AM16);
 - correlationIds restart at 1 in every process when collide_correlation_ids is True (D6-8).
@@ -25,6 +27,7 @@ RANK_SKEW_NS = 3_000
 RANGE_NS = 30_000
 IDLE_GAP_NS = 20_000
 LAUNCH_LATENCY_NS = 4_000
+GRAPH_LAUNCH_NS = 5_000          # the forward's cudaGraphLaunch, after the range start
 PDL_OVERLAP_NS = 500
 SYNC_WAIT_NS = 2_000
 MEASURE_PAD_NS = 1_000
@@ -179,7 +182,10 @@ def _layout(w: _Writer, ri: int, rank: dict, collide: bool) -> tuple[int, int]:
     ks = kernels_for_step(tp, rank["ar_backend"], rank["batch"])
     split = next(i for i, (n, _) in enumerate(ks) if n == LM_HEAD)
     work = sum(d for _, d in ks)
-    period = work + IDLE_GAP_NS
+    n_ops = sum(n in _PDL or n in (CUSTOM_AR, NCCL_AR) for n, _ in ks[:split])
+    sync = -(-n_ops // tp) * SYNC_WAIT_NS if tp > 1 else 0   # the most spin-waits any rank adds
+    # the input copy and its gap fit before GRAPH_LAUNCH_NS; PDL overlap only shortens the step
+    period = GRAPH_LAUNCH_NS + work + sync + IDLE_GAP_NS
     n_keep = len(rank["steps"]) - rank.get("drop_last", 0)
     cid = 0 if collide else ri * 1_000_000
     cpu = T0_NS + ri * RANK_SKEW_NS
@@ -212,7 +218,7 @@ def _layout(w: _Writer, ri: int, rank: dict, collide: bool) -> tuple[int, int]:
         w.add("CUPTI_ACTIVITY_KIND_MEMCPY", (start, start + 1_500, device, 7, c, gpid, 8 * rank["batch"], 1, None))
         gpu = start + 1_500
         # the forward: one CUDA graph launch, all node kernels share its correlationId
-        t = cpu + 5_000
+        t = cpu + GRAPH_LAUNCH_NS
         c = launch("cudaGraphLaunch_v10000", t, 8_000)
         op = 0
         for node, (name, dur) in enumerate(ks[:split], start=1):

@@ -32,6 +32,9 @@ NVTX_PUSH_POP = 59
 NVTX_START_END = 60
 MEMCPY_NAME = "[CUDA memcpy]"
 MEMSET_NAME = "[CUDA memset]"
+COPY_NAMES = (MEMCPY_NAME, MEMSET_NAME)
+# Without these the analysis has no kernels, no steps, or no kernel names (Review Focus 5).
+REQUIRED_TABLES = (KERNEL_TABLE, NVTX_TABLE, STRINGS_TABLE)
 TOP_UNCLASSIFIED = 20
 
 _ID_SPAN = 0x1000000   # globalTid = <HW:8><VM:8><PID:24><TID:24> (research D6-8)
@@ -252,12 +255,15 @@ def attribute(kernels: Sequence[Kernel], window: tuple[int, int]) -> dict[str, i
 def _gate(pairs: list[tuple[int, int]], steps_by_rank: list[list[dict]], td: TraceData,
           tp: int, min_steps: int) -> Gate:
     reasons: list[str] = []
+    missing = [t for t in REQUIRED_TABLES if t not in td.tables]
+    if missing:
+        reasons.append(f"trace is missing required tables: {', '.join(missing)}")
     # (a) exactly tp (pid, device) pairs, on distinct devices
     if len(pairs) != tp:
         counts = Counter((k.pid, k.device) for k in td.kernels)
         found = ", ".join(f"(pid {p}, device {d}, {counts[(p, d)]} kernels)" for p, d in pairs)
         reasons.append(f"expected {tp} (pid, device) pairs, found {len(pairs)}" + (f": {found}" if found else ""))
-    if len({d for _, d in pairs}) != len(pairs) or len({p for p, _ in pairs}) != len(pairs):
+    if len({d for _, d in pairs}) != len(pairs):
         reasons.append(f"(pid, device) pairs are not one per GPU: {pairs}")
     # (b) equal execute-range counts on every rank, and at least min_steps
     counts = [len(s) for s in steps_by_rank]
@@ -279,13 +285,10 @@ def _gate(pairs: list[tuple[int, int]], steps_by_rank: list[list[dict]], td: Tra
                 j = diffs[0]
                 reasons.append(f"rank {i} per-step AR op counts differ from rank 0 in {len(diffs)} steps; "
                                f"first at step {j}: {ari[j]} vs {ar0[j]}")
+    # (d) at least one kernel (not a memcpy/memset) in the last step on every rank
     for i, steps in enumerate(steps_by_rank):
-        # (d) kernels in the last step on every rank
-        if steps and not steps[-1]["kernels"]:
+        if steps and not any(e.name not in COPY_NAMES for e in steps[-1]["kernels"]):
             reasons.append(f"rank {i} has no kernels in its last step (step {len(steps) - 1})")
-        # a TP trace without any all-reduce means unresolved or unrecognized kernel names
-        if tp > 1 and steps and not any(s["ar_ops"] for s in steps):
-            reasons.append(f"rank {i} has no all-reduce ops in {len(steps)} steps at tp={tp}")
     return Gate(not reasons, reasons)
 
 

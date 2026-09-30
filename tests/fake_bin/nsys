@@ -21,7 +21,11 @@ import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-VERSION = "NVIDIA Nsight Systems version 2026.5.1.161-265138896106v0"
+sys.path.insert(0, str(ROOT))
+
+from tpprof.constants import NSYS_VERSION  # noqa: E402  (after the sys.path insert)
+
+VERSION = f"NVIDIA Nsight Systems version {NSYS_VERSION}.161-265138896106v0"
 
 
 def _options(args: list[str]) -> tuple[dict[str, str], list[str]]:
@@ -90,7 +94,6 @@ def export(args: list[str]) -> int:
     for i, r in enumerate(ranks):
         r["drop_last"] = 3 if drop and r.get("rank", i) == 1 else 0
 
-    sys.path.insert(0, str(ROOT))
     from tests.synth_trace import build_trace_db, trace_span
 
     # the offline driver's tpprof:measure range spans the measured steps in both capture modes

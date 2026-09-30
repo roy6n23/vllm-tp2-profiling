@@ -134,6 +134,23 @@ def test_step_assignment_uses_launch_time_not_gpu_start(tmp_path):
         assert [s["ag_ops"] for s in steps] == [1] * 20
 
 
+@pytest.mark.parametrize("tp, ar_backend, batch", [
+    (2, "trtllm", 1), (2, "nccl", 1), (1, "none", 1),
+])
+def test_synthetic_gpu_lag_is_bounded_by_one_step(tmp_path, tp, ar_backend, batch):
+    # the GPU lags by up to one step, over the spec's ~256-step window, without a growing backlog
+    n = 256
+    ranks = [_rank(42420 + r, r, tp=tp, ar_backend=ar_backend, batch=batch, n=n) for r in range(tp)]
+    td = traces.load_trace(_db(tmp_path, ranks))
+    for pid, device in traces.worker_ranks(td):
+        steps = traces.assign_steps(td, pid, device)
+        assert len(steps) == n
+        lags = [(min(e.start for e in s["kernels"]) - s["start"]) / (nxt["start"] - s["start"])
+                for s, nxt in zip(steps, steps[1:])]
+        assert 0.2 < min(lags) and max(lags) < 1
+        assert max(lags[-20:]) <= max(lags[:20]) + 0.05
+
+
 def test_gate_fails_when_rank_loses_tail(tmp_path):
     db = _db(tmp_path, _tp2(drop_last_rank1=3))
     gate = traces.completeness_gate(traces.load_trace(db), tp=2, min_steps=5)
@@ -177,13 +194,16 @@ def test_gate_fails_when_last_step_has_no_kernels(tmp_path):
     db = _db(tmp_path, _tp2())
     last = traces.step_ranges(traces.load_trace(db), 42421)[-1].start
     con = sqlite3.connect(db)
-    for table in ("CUPTI_ACTIVITY_KIND_KERNEL", "CUPTI_ACTIVITY_KIND_MEMCPY"):
-        con.execute(f"DELETE FROM {table} WHERE globalPid = ? AND correlationId IN (SELECT correlationId FROM "
-                    "CUPTI_ACTIVITY_KIND_RUNTIME WHERE globalTid >> 24 = ? AND start >= ?)",
-                    (42421 << 24, 42421, last))
+    # delete rank 1's last-step kernels only; its input memcpy stays and must not satisfy (d)
+    con.execute("DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE globalPid = ? AND correlationId IN (SELECT "
+                "correlationId FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE globalTid >> 24 = ? AND start >= ?)",
+                (42421 << 24, 42421, last))
     con.commit()
     con.close()
-    gate = traces.completeness_gate(traces.load_trace(db), tp=2, min_steps=5)
+    td = traces.load_trace(db)
+    last_step = traces.assign_steps(td, 42421, 1)[-1]
+    assert [k.name for k in last_step["kernels"]] == [traces.MEMCPY_NAME]
+    gate = traces.completeness_gate(td, tp=2, min_steps=5)
     assert not gate.ok
     assert "rank 1 has no kernels in its last step (step 19)" in gate.reasons
 
@@ -219,9 +239,9 @@ def test_missing_tables_tolerated(tmp_path, table):
         # launch times fall back to the GPU start, and every fallback is counted
         assert summary["launch_ts_missing"] == len(td.kernels) + len(td.copies) > 0
     else:
-        # no kernels, no step ranges, or no kernel names: the gate names the problem
+        # no kernels, no step ranges, or no kernel names: the gate names the missing table
         assert summary["gate"]["ok"] is False
-        assert summary["gate"]["reasons"]
+        assert f"trace is missing required tables: {table}" in summary["gate"]["reasons"]
 
 
 def test_kernel_names_fall_back_to_short_name(tmp_path):

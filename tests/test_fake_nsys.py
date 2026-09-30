@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from tests.conftest import FAKE_BIN, fake_env
-from tpprof import traces
+from tpprof import constants, traces
 
 NSYS = str(FAKE_BIN / "nsys")
 
@@ -47,7 +47,8 @@ def test_fake_nsys_is_executable():
 def test_version(tmp_path):
     r = subprocess.run([NSYS, "--version"], env=fake_env(tmp_path), capture_output=True, text=True)
     assert r.returncode == 0
-    assert r.stdout.strip() == "NVIDIA Nsight Systems version 2026.5.1.161-265138896106v0"
+    # the version comes from the pin in tpprof/constants.py, not a retyped literal
+    assert r.stdout.strip() == f"NVIDIA Nsight Systems version {constants.NSYS_VERSION}.161-265138896106v0"
 
 
 def test_status_environment(tmp_path):
