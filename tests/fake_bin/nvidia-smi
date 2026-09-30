@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Fake nvidia-smi answering the C8 query forms for a 2x H100 SXM box.
+
+FAKE_NVSMI_SCENARIO changes exactly one aspect: ok | one_gpu | pcie | old_driver | nv12 | busy |
+no_fabric | power_capped. memory.used for GPU i and --query-compute-apps come from the state files
+live fake servers write to $FAKE_GPU_STATE_DIR/gpu<i>.json.
+"""
+from __future__ import annotations
+
+import datetime
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests.fakes import common  # noqa: E402
+
+BUSY_MIB, BUSY_PID = 30000, 424242
+
+
+def scenario() -> str:
+    return os.environ.get("FAKE_NVSMI_SCENARIO") or "ok"
+
+
+def gpus() -> list[dict]:
+    sc = scenario()
+    states = common.gpu_states()
+    out = []
+    for i in range(1 if sc == "one_gpu" else 2):
+        used = int(states.get(i, {}).get("used_mib", 0)) + (BUSY_MIB if sc == "busy" else 0)
+        active = used > 1024
+        out.append({
+            "index": str(i),
+            "name": "NVIDIA H100 PCIe" if sc == "pcie" else "NVIDIA H100 80GB HBM3",
+            "driver_version": "575.57.08" if sc == "old_driver" else "580.95.05",
+            "memory.total": 81559,
+            "memory.used": used,
+            "memory.free": 81559 - used,
+            "power.limit": {"pcie": "350.00", "power_capped": "500.00"}.get(sc, "700.00"),
+            "power.draw": "412.37" if active else "71.24",
+            "pci.bus_id": f"00000000:{18 + i}:00.0",
+            "uuid": f"GPU-f00df00d-0000-4000-8000-00000000000{i}",
+            "clocks.sm": "1980" if active else "345",
+            "clocks.mem": "2619",
+            "temperature.gpu": "47" if active else "31",
+            "utilization.gpu": "63" if active else "0",
+            "clocks_event_reasons.active": "0x0000000000000000" if active else "0x0000000000000001",
+        })
+    return out
+
+
+UNITS = {"memory.total": "MiB", "memory.used": "MiB", "memory.free": "MiB", "power.limit": "W",
+         "power.draw": "W", "clocks.sm": "MHz", "clocks.mem": "MHz", "utilization.gpu": "%",
+         "used_memory": "MiB"}
+ALIASES = {"clocks_throttle_reasons.active": "clocks_event_reasons.active", "gpu_name": "name",
+           "gpu_bus_id": "pci.bus_id"}
+
+
+def fail(msg: str, code: int = 2) -> None:
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def csv_rows(fields: list[str], rows: list[dict], fmt: str, header: bool = True) -> list[str]:
+    opts = set(fmt.split(","))
+    if "csv" not in opts:
+        fail(f'"{fmt}" is not a valid format.')
+    out = []
+    if header and "noheader" not in opts:
+        out.append(", ".join(f"{f} [{UNITS[f]}]" if f in UNITS and "nounits" not in opts else f for f in fields))
+    for row in rows:
+        cells = []
+        for f in fields:
+            value = str(row[f])
+            if f in UNITS and "nounits" not in opts:
+                value = f"{value} {UNITS[f]}"
+            cells.append(value)
+        out.append(", ".join(cells))
+    return out
+
+
+def query_gpu(fields: list[str], fmt: str, header: bool = True) -> list[str]:
+    now = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f")[:-3]
+    rows = []
+    for g in gpus():
+        row = dict(g, timestamp=now)
+        rows.append({f: row[ALIASES.get(f, f)] for f in fields})
+    return csv_rows(fields, rows, fmt, header)
+
+
+def query_apps(fields: list[str], fmt: str) -> list[str]:
+    visible = {int(g["index"]) for g in gpus()}
+    apps = [{"pid": s["pid"], "used_memory": s["used_mib"], "gpu_bus_id": f"00000000:{18 + i}:00.0"}
+            for i, s in common.gpu_states().items() if i in visible]
+    if scenario() == "busy":
+        apps.append({"pid": BUSY_PID, "used_memory": BUSY_MIB, "gpu_bus_id": "00000000:18:00.0"})
+    return csv_rows(fields, [{f: a[f] for f in fields} for a in apps], fmt) if apps else []
+
+
+def topo() -> str:
+    sc = scenario()
+    link = {"pcie": "PIX", "nv12": "NV12"}.get(sc, "NV18")
+    n = len(gpus())
+    names = [f"GPU{i}" for i in range(n)]
+    lines = ["\t" + "\t".join(names + ["CPU Affinity", "NUMA Affinity", "GPU NUMA ID"])]
+    for i in range(n):
+        cells = [" X " if j == i else link for j in range(n)]
+        lines.append("\t".join([names[i], *cells, "0-63", "0", "", "N/A"]))
+    lines += ["", "Legend:", "",
+              "  X    = Self",
+              "  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)",
+              "  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node",
+              "  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)",
+              "  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)",
+              "  PIX  = Connection traversing at most a single PCIe bridge",
+              "  NV#  = Connection traversing a bonded set of # NVLinks", ""]
+    return "\n".join(lines)
+
+
+def nvlink_status() -> str:
+    nlinks = {"pcie": 0, "nv12": 12}.get(scenario(), 18)
+    lines = []
+    for g in gpus():
+        lines.append(f"GPU {g['index']}: {g['name']} (UUID: {g['uuid']})")
+        lines += [f"\t Link {k}: 26.562 GB/s" for k in range(nlinks)]
+    return "\n".join(lines) + "\n"
+
+
+def full_query() -> str:
+    sc = scenario()
+    gs = gpus()
+    kv = lambda key, value, indent=4: f"{' ' * indent}{key:<{50 - indent}}: {value}"  # noqa: E731
+    lines = ["", "==============NVSMI LOG==============", "",
+             kv("Timestamp", time.strftime("%a %b %d %H:%M:%S %Y"), 0),
+             kv("Driver Version", gs[0]["driver_version"], 0),
+             kv("CUDA Version", "13.0", 0), "",
+             kv("Attached GPUs", len(gs), 0)]
+    for g in gs:
+        lines += [f"GPU {g['pci.bus_id']}",
+                  kv("Product Name", g["name"]),
+                  kv("Product Brand", "NVIDIA"),
+                  kv("Product Architecture", "Hopper"),
+                  kv("Persistence Mode", "Enabled"),
+                  kv("GPU UUID", g["uuid"]),
+                  kv("Minor Number", g["index"]),
+                  "    Fabric",
+                  kv("State", "In Progress" if sc == "no_fabric" else "Completed", 8),
+                  kv("Status", "N/A" if sc == "no_fabric" else "Success", 8),
+                  kv("CliqueId", "0", 8),
+                  kv("ClusterUUID", "00000000-0000-0000-0000-000000000000", 8),
+                  "    FB Memory Usage",
+                  kv("Total", f"{g['memory.total']} MiB", 8),
+                  kv("Reserved", "551 MiB", 8),
+                  kv("Used", f"{g['memory.used']} MiB", 8),
+                  kv("Free", f"{g['memory.free']} MiB", 8),
+                  "    GPU Power Readings",
+                  kv("Average Power Draw", f"{g['power.draw']} W", 8),
+                  kv("Current Power Limit", f"{g['power.limit']} W", 8),
+                  kv("Max Power Limit", f"{g['power.limit']} W", 8),
+                  "    Clocks",
+                  kv("SM", f"{g['clocks.sm']} MHz", 8),
+                  kv("Memory", f"{g['clocks.mem']} MHz", 8),
+                  ""]
+    return "\n".join(lines) + "\n"
+
+
+def emit(lines: list[str]) -> None:
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def main(argv: list[str]) -> int:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    if not argv:
+        emit([f"GPU {g['index']}: {g['name']}, {g['memory.used']}MiB / {g['memory.total']}MiB" for g in gpus()])
+        return 0
+    if argv[:2] == ["topo", "-m"]:
+        sys.stdout.write(topo())
+        return 0
+    if argv[:2] == ["nvlink", "-s"]:
+        sys.stdout.write(nvlink_status())
+        return 0
+    if argv == ["-q"]:
+        sys.stdout.write(full_query())
+        return 0
+    if argv == ["-L"]:
+        emit([f"GPU {g['index']}: {g['name']} (UUID: {g['uuid']})" for g in gpus()])
+        return 0
+
+    opts: dict[str, str] = {}
+    it = iter(argv)
+    for arg in it:
+        if "=" in arg and arg.startswith("--"):
+            key, value = arg.split("=", 1)
+            opts[key] = value
+        elif arg in ("-lms", "-l", "--format", "--query-gpu", "--query-compute-apps"):
+            opts[arg] = next(it, "")
+        else:
+            fail(f"Invalid combination of input arguments: {arg}")
+    fmt = opts.get("--format", "csv")
+    if "--query-compute-apps" in opts:
+        fields = opts["--query-compute-apps"].split(",")
+        known = {"pid", "used_memory", "gpu_bus_id"}
+        if not set(fields) <= known:
+            fail(f'Field "{sorted(set(fields) - known)[0]}" is not a valid field to query.')
+        emit(query_apps(fields, fmt))
+        return 0
+    if "--query-gpu" not in opts:
+        fail("Invalid combination of input arguments. Please run 'nvidia-smi -h' for help.")
+    fields = opts["--query-gpu"].split(",")
+    known = set(gpus()[0]) | {"timestamp"} | set(ALIASES)
+    for f in fields:
+        if f not in known:
+            fail(f'Field "{f}" is not a valid field to query.')
+    interval_s = float(opts["-lms"]) / 1000 if "-lms" in opts else (float(opts["-l"]) if "-l" in opts else None)
+    if interval_s is None:
+        emit(query_gpu(fields, fmt))
+        return 0
+    try:
+        emit(query_gpu(fields, fmt))
+        while True:
+            time.sleep(interval_s)
+            emit(query_gpu(fields, fmt, header=False))
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
