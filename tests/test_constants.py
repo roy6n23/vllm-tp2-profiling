@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from tpprof import constants as c
 
 
