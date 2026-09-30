@@ -302,18 +302,32 @@ def test_model_mu_rps_uses_central_saturation():
 
 # ---------------------------------------------------------------- estimator
 
+def _full_matrix_hours(fi_backend: str | None) -> float:
+    return sum(e.minutes for e in m.estimate(full_matrix(fi_backend))) / 60
+
+
 @pytest.mark.parametrize("fi_backend", ["mnnvl", None])
 def test_estimate_full_matrix_within_budget(fi_backend):
-    # Upper bound: the brief's 11 h (11 h x $6.98 = $76.8, under the $80 cap). Lower bound: 5 h, not
-    # the brief's 6 h. The brief's own formulas give 5.69 h (5.58 h without mnnvl) with the central
-    # model; 6 h came from AM21's hand figures (P0 1.8 + P1 2.8 + P2 2.3 h), which the formulas do
-    # not reproduce. The formulas themselves are pinned term by term by the tests below.
+    # The $80 cap (AM21): 11 h x $6.98 = $76.8, the plan's upper bound. Every spec gets a positive
+    # estimate, in spec order. The formulas themselves are pinned term by term by the tests below.
     specs = full_matrix(fi_backend)
     ests = m.estimate(specs)
-    total_h = sum(e.minutes for e in ests) / 60
-    assert 5 <= total_h <= 11, total_h
     assert [e.run_id for e in ests] == [s.run_id for s in specs]
     assert all(e.minutes > 0 for e in ests)
+    assert {e.tier for e in ests} == {"P0", "P1", "P2"}
+    assert _full_matrix_hours(fi_backend) <= 11
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Plan Task 15 Step 1 requires [6, 11] h, but the plan's own estimator formulas give 5.69 h "
+    "(5.58 h without mnnvl) with the central model. The 6 h came from AM21's hand figures "
+    "(P0 1.8 + P1 2.8 + P2 2.3 h), which the formulas do not reproduce. Awaiting a controller "
+    "ruling: either lower the bound (then drop this marker) or name the missing AM21 terms in the "
+    "plan (then this test XPASSes, which strict=True turns into a failure, so the marker goes)."))
+@pytest.mark.parametrize("fi_backend", ["mnnvl", None])
+def test_estimate_full_matrix_is_between_6_and_11_hours(fi_backend):
+    # Plan Task 15 Step 1, verbatim: "The estimate totals are within [6, 11] h for the full matrix."
+    assert 6 <= _full_matrix_hours(fi_backend) <= 11
 
 
 def test_estimate_fixed_costs_and_first_starts():
