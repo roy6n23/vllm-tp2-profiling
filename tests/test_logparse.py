@@ -255,9 +255,9 @@ def test_fibtrtllm_rejects_mnnvl():
 
 def test_dp2_log_fails_single_engine_expectation_and_vice_versa():
     one = check(parse("dp2_base.log"), expectation_for("TP1", "base", True))
-    # DP2 passes no executor flag, so the TP1 mp pin is also reported missing.
-    assert len(one) == 2 and "GPU KV cache size:" in one[0] and "expected 1" in one[0]
-    assert "'distributed_executor_backend': 'mp'" in one[1] and "found executor None" in one[1]
+    # DP2 passes no executor flag, so its log records no executor value, and a missing value is not a violation.
+    assert parse("dp2_base.log").executor is None
+    assert len(one) == 1 and "GPU KV cache size:" in one[0] and "expected 1" in one[0]
     two = check(parse("tp1_base.log"), expectation_for("DP2", "base", True))
     assert len(two) == 1 and "expected 2" in two[0]
 
@@ -332,10 +332,6 @@ def test_exec_uni_requires_uni_and_base_requires_mp():
     assert len(mp) == 1 and "'distributed_executor_backend': 'mp'" in mp[0] and "found executor uni" in mp[0]
     for config in ("DP2rand0", "DP2rand1"):
         assert len(check(parse("tp1_exec_uni.log"), expectation_for(config, "base", True))) == 1
-    tp2 = parse_engine_log(read("tp2_base_mnnvl.log").replace("'distributed_executor_backend': 'mp', ", ""))
-    assert tp2.executor is None
-    missing = check(tp2, expectation_for("TP2", "base", True))
-    assert len(missing) == 1 and "found executor None" in missing[0]
 
 
 NONDEFAULT_HEADER = "(APIServer pid=4101) INFO 09-30 10:00:00 [api_utils.py:286] non-default args: "
@@ -347,18 +343,69 @@ def with_nondefault_line(name: str, args: str) -> str:
     return "\n".join([NONDEFAULT_HEADER + args] + lines[1:])
 
 
+@pytest.mark.parametrize("args", ["{...}", "{'model_tag': '/models/llama'}"])
 @pytest.mark.parametrize("name,config,arm", [
     ("tp1_base.log", "TP1", "base"), ("tp1_base.log", "DP2rand0", "base"), ("tp1_base.log", "DP2rand1", "base"),
     ("tp1_exec_uni.log", "TP1", "EXECuni"), ("tp2_base_mnnvl.log", "TP2", "base"), ("tp2_ar2.log", "TP2", "AR2"),
 ])
-def test_placeholder_nondefault_line_fails_the_executor_pin(name, config, arm):
-    # A fake that prints C6's example line literally ("non-default args: {...}") carries no executor value, so
-    # the AM2 pin cannot be verified: exactly one violation, naming the key the line must contain.
-    eff = parse_engine_log(with_nondefault_line(name, "{...}"))
+def test_log_without_an_executor_value_records_none_and_passes(name, config, arm, args):
+    # C6 shows the line as "non-default args: {...}", and neither C6's banner nor the real 0.30.0 banner has an
+    # executor field, so a log that follows C6 may carry no executor value at all. It is recorded as None and
+    # is not a violation (AM2: logparse records the executor). Only a recorded value that differs is flagged.
+    eff = parse_engine_log(with_nondefault_line(name, args))
     assert eff.executor is None
-    exp = expectation_for(config, arm, True)
-    assert check(eff, exp) == [f"expected \"'distributed_executor_backend': '{exp.executor}'\" in the "
-                               "\"non-default args:\" line (found executor None)."]
+    assert check(eff, expectation_for(config, arm, True)) == []
+
+
+# contracts.md C6, verbatim: the messages "as the fake emits them", with C6's process prefixes (TP1-like and DP2
+# lines under EngineCore / EngineCore_DP<i>, TP2 worker lines under Worker_TP0, uvicorn under APIServer).
+C6_AR_TAIL = (" all-reduce backends (in dispatch order) for group 'tp:0' out of potential backends: "
+              "['FLASHINFER_PCIE_IPC', 'FLASHINFER', 'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM', "
+              "'SYMM_MEM', 'PYNCCL'].")
+C6_AR_DEFAULT = "['FLASHINFER', 'CUSTOM', 'SYMM_MEM', 'PYNCCL']"   # C6's list; AR2 and AR3 change it (AM3)
+C6_AR_LIST = {"AR2": "['CUSTOM', 'PYNCCL']", "AR3": "['PYNCCL']"}
+C6_PAIRS = ([(c, "base") for c in ("TP1", "DP2rand0", "DP2rand1", "TP2", "DP2")]
+            + [("TP2", a) for a in ("AR1", "AR2", "AR3", "G1", "G2", "PCon", "FIBtrtllm", "API2")]
+            + [("TP1", "G1"), ("TP1", "G2"), ("TP1", "EXECuni"), ("DP2", "API2")])
+
+
+def c6_log(config: str, arm: str) -> str:
+    tp2, dp = config == "TP2", 2 if config == "DP2" else 1
+    lines = [("APIServer", "non-default args: {...}")]
+    for eng in ([f"EngineCore_DP{i}" for i in range(dp)] if dp > 1 else ["EngineCore"]):
+        w = "Worker_TP0" if tp2 else eng
+        lines += [(eng, "Initializing a V1 LLM engine (v0.30.0) with config: model='/models/llama', ..., "
+                        f"tensor_parallel_size={2 if tp2 else 1}, data_parallel_size={dp}, "
+                        f"disable_custom_all_reduce={arm == 'AR3'}, enforce_eager={arm == 'G2'}, ..."),
+                  (eng, "Chunked prefill is enabled with max_num_batched_tokens=8192."),
+                  (w, "Using V2 Model Runner"),
+                  (w, "Using AttentionBackendEnum.FLASH_ATTN backend."),
+                  (w, "Using FlashAttention version 3")]
+        if tp2:
+            lines += [(w, "vLLM is using nccl==2.30.7"),
+                      (w, "Using " + C6_AR_LIST.get(arm, C6_AR_DEFAULT) + C6_AR_TAIL)]
+            if arm in ("base", "G1"):
+                lines.append((w, "Enabled custom fusions: allreduce_rms"))
+            if arm not in ("AR2", "AR3", "G2"):
+                lines.append((w, "Initialized FlashInfer Allreduce norm fusion workspace with backend="
+                                 + ("trtllm" if arm == "FIBtrtllm" else "mnnvl")))
+        lines += [(w, "Model loading took 14.99 GiB memory and 12.345678 seconds"),
+                  (w, "Available KV cache memory: 51.39 GiB"),
+                  (eng, "GPU KV cache size: 420,959 tokens, Maximum concurrency for 9,216 tokens per request: 45.68x")]
+        lines.append((eng, "Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting "
+                           "-cc.mode=none -cc.cudagraph_mode=none") if arm == "G2"
+                     else (w, "Graph capturing finished in 18 secs, took 0.52 GiB"))
+    pids = {proc: 4101 + i for i, proc in enumerate(dict.fromkeys(proc for proc, _ in lines))}
+    out = [f"({proc} pid={pids[proc]}) INFO 09-30 10:00:00 [fake.py:1] {msg}" for proc, msg in lines]
+    return "\n".join(out + ["(APIServer pid=4101) INFO:     Application startup complete."]) + "\n"
+
+
+@pytest.mark.parametrize("config, arm", C6_PAIRS)
+def test_c6_literal_log_passes_its_expectation(config, arm):
+    # The review finding: a fake that prints C6 literally carries no executor value and must still pass check().
+    eff = parse_engine_log(c6_log(config, arm))
+    assert eff.executor is None
+    assert check(eff, expectation_for(config, arm, True)) == []
 
 
 @pytest.mark.parametrize("args", [

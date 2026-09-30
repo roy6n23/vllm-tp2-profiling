@@ -92,7 +92,7 @@ class EffectiveConfig:
     fi_backend: str | None = None                                  # "mnnvl" | "trtllm"
     fi_backend_fallback: bool = False
     nccl_version: str | None = None
-    executor: str | None = None                                    # from banner: distributed_executor_backend=...
+    executor: str | None = None     # banner distributed_executor_backend=..., else non-default args; None if neither
     enforce_eager: bool = False
     sampling_override: bool = False
     mrv2_fallback: bool = False
@@ -162,8 +162,8 @@ def parse_engine_log(text: str) -> EffectiveConfig:
             eff.hard_failures.append(msg)
     eff.attention_explicit = attention_forms == {"explicit"}
     if eff.executor is None:
-        # The real 0.30.0 banner has no executor field; the CLI input always carries it because the
-        # flag's default is None (D5-8), and every config pins it (AM2).
+        # The real 0.30.0 banner has no executor field. The real non-default args line carries the flag whenever it
+        # is passed, because its default is None (D5-8); C1 passes it for every config except DP2 (AM2).
         eff.executor = nondefault_executor
     return eff
 
@@ -178,7 +178,8 @@ class Expectation:
     require_fi_workspace: bool = False  # AR0, AR1, G1, PCon, FIBtrtllm, API2
     require_enforce_eager: bool = False # G2
     fi_backend_exact: str | None = None # FIBtrtllm: "trtllm"
-    executor: str | None = None         # pinned --distributed-executor-backend (AM2): "mp", or "uni" for EXECuni
+    executor: str | None = None         # pinned --distributed-executor-backend (AM2): "mp", or "uni" for EXECuni;
+                                        # a recorded executor must equal it, a log without one is not checked
 
 
 # Config -> (engines, tp2, pinned executor). DP2rand0/1 are single-engine TP1-like configs (ruling R6). C1 pins
@@ -258,7 +259,10 @@ def check(eff: EffectiveConfig, exp: Expectation) -> list[str]:
         v.append(f'unexpected line "{MRV2_FALLBACK}" (the engine fell back to the V1 model runner).')
     if exp.serve and not eff.startup_complete:
         v.append(f'missing line "{STARTUP_COMPLETE}".')
-    if exp.executor is not None and eff.executor != exp.executor:
+    # The executor is checked only when the log records one. C6 shows "non-default args: {...}" and a banner
+    # without the executor (the real 0.30.0 banner has none either, config/vllm.py:2604-2639), so a log that
+    # follows C6 may carry no value; AM2 asks logparse to record the executor, and None is that record.
+    if exp.executor is not None and eff.executor is not None and eff.executor != exp.executor:
         v.append(f"expected \"'distributed_executor_backend': '{exp.executor}'\" in the \"non-default args:\" line "
                  f"(found executor {eff.executor}).")
     if exp.require_enforce_eager and not eff.enforce_eager:
