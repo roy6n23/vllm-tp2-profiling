@@ -1,0 +1,76 @@
+params: embed 525336576 attn/layer 41943040 mlp/layer 176160768 per_layer 218112000
+params total 8030261248  (HF safetensors metadata says 8030261248)
+bf16 bytes total 16060522496 GB 16.060522496 GiB 14.957527160644531
+TP2 per-rank params 4015263744 bytes 8030527488 GB 8.030527488 GiB 7.479011535644531
+KV bytes/token total 131072 TP2 per GPU 65536
+matmul params excl lm_head 6979321856 incl 7504658432
+FLOPs/token excl lm_head 13958643712 incl 15009316864
+prefill N=512: linear 7.148 TF, attn 0.069 TF, attn share 0.954%
+prefill N=2048: linear 28.588 TF, attn 1.100 TF, attn share 3.705%
+prefill N=8192: linear 114.350 TF, attn 17.594 TF, attn share 13.335%
+decode attn FLOPs/token @ctx c = 4*L*NH*HD*c = 524288 * c
+weight bytes streamed/step: TP1 15.0098 GB, TP2 per GPU 7.5052 GB
+
+== central (bw3.0, o0.8, FI/custom AR a=5us)
+  decode B=  1 ctx=1024: TP1   5.85 ms  TP2   3.76 ms (AR total  0.33 ms)  speedup 1.55  eff 77.7%
+  decode B=  8 ctx=1024: TP1   6.16 ms  TP2   3.93 ms (AR total  0.34 ms)  speedup 1.57  eff 78.4%
+  decode B= 32 ctx=1024: TP1   7.23 ms  TP2   4.51 ms (AR total  0.37 ms)  speedup 1.60  eff 80.2%
+  decode B=128 ctx=1024: TP1  11.53 ms  TP2   6.84 ms (AR total  0.52 ms)  speedup 1.69  eff 84.3%
+
+== optimistic (bw3.1, o0.4, a=4us)
+  decode B=  1 ctx=1024: TP1   5.29 ms  TP2   3.16 ms (AR total  0.26 ms)  speedup 1.67  eff 83.5%
+  decode B=  8 ctx=1024: TP1   5.59 ms  TP2   3.33 ms (AR total  0.27 ms)  speedup 1.68  eff 84.0%
+  decode B= 32 ctx=1024: TP1   6.63 ms  TP2   3.89 ms (AR total  0.30 ms)  speedup 1.71  eff 85.3%
+  decode B=128 ctx=1024: TP1  10.78 ms  TP2   6.12 ms (AR total  0.43 ms)  speedup 1.76  eff 88.1%
+
+== pessimistic (bw2.7, o1.2, a=5us)
+  decode B=  1 ctx=1024: TP1   6.81 ms  TP2   4.54 ms (AR total  0.33 ms)  speedup 1.50  eff 75.0%
+  decode B=  8 ctx=1024: TP1   7.16 ms  TP2   4.73 ms (AR total  0.34 ms)  speedup 1.51  eff 75.6%
+  decode B= 32 ctx=1024: TP1   8.35 ms  TP2   5.38 ms (AR total  0.38 ms)  speedup 1.55  eff 77.6%
+  decode B=128 ctx=1024: TP1  13.12 ms  TP2   7.98 ms (AR total  0.55 ms)  speedup 1.64  eff 82.2%
+
+== NCCL-forced (bw3.0, o0.8, a=10us)
+  decode B=  1 ctx=1024: TP1   5.85 ms  TP2   4.09 ms (AR total  0.65 ms)  speedup 1.43  eff 71.6%
+  decode B=  8 ctx=1024: TP1   6.16 ms  TP2   4.26 ms (AR total  0.66 ms)  speedup 1.45  eff 72.4%
+  decode B= 32 ctx=1024: TP1   7.23 ms  TP2   4.84 ms (AR total  0.70 ms)  speedup 1.50  eff 74.8%
+  decode B=128 ctx=1024: TP1  11.53 ms  TP2   7.17 ms (AR total  0.84 ms)  speedup 1.61  eff 80.4%
+
+== NCCL-forced slow (a=17us)
+  decode B=  1 ctx=1024: TP1   5.85 ms  TP2   4.54 ms (AR total  1.11 ms)  speedup 1.29  eff 64.4%
+  decode B=  8 ctx=1024: TP1   6.16 ms  TP2   4.71 ms (AR total  1.12 ms)  speedup 1.31  eff 65.4%
+  decode B= 32 ctx=1024: TP1   7.23 ms  TP2   5.30 ms (AR total  1.16 ms)  speedup 1.36  eff 68.2%
+  decode B=128 ctx=1024: TP1  11.53 ms  TP2   7.66 ms (AR total  1.33 ms)  speedup 1.50  eff 75.2%
+
+== central (GEMM 700, attn 400 TF, a=5us b=350GB/s)
+  prefill N=  512: TP1   12.15 ms  TP2    7.86 ms (AR  1.10 ms, msg 4 MiB)  speedup 1.55  eff 77.3%
+  prefill N= 2048: TP1   48.26 ms  TP2   28.78 ms (AR  3.44 ms, msg 16 MiB)  speedup 1.68  eff 83.8%
+  prefill N= 8192: TP1  223.61 ms  TP2  127.90 ms (AR 12.79 ms, msg 64 MiB)  speedup 1.75  eff 87.4%
+
+== pessimistic comm (b=250GB/s, a=10us)
+  prefill N=  512: TP1   12.15 ms  TP2    8.50 ms (AR  1.74 ms, msg 4 MiB)  speedup 1.43  eff 71.5%
+  prefill N= 2048: TP1   48.26 ms  TP2   30.35 ms (AR  5.01 ms, msg 16 MiB)  speedup 1.59  eff 79.5%
+  prefill N= 8192: TP1  223.61 ms  TP2  133.21 ms (AR 18.10 ms, msg 64 MiB)  speedup 1.68  eff 83.9%
+
+== optimistic (GEMM 790, attn 500, b=400)
+  prefill N=  512: TP1   10.62 ms  TP2    6.78 ms (AR  0.94 ms, msg 4 MiB)  speedup 1.57  eff 78.3%
+  prefill N= 2048: TP1   42.63 ms  TP2   25.34 ms (AR  2.99 ms, msg 16 MiB)  speedup 1.68  eff 84.1%
+  prefill N= 8192: TP1  195.40 ms  TP2  111.93 ms (AR 11.17 ms, msg 64 MiB)  speedup 1.75  eff 87.3%
+
+requested memory @0.9 = 71.20 GiB
+  non-KV overhead TP1 2.5 GiB / TP2 2.9 GiB -> KV TP1 53.71 GiB = 440K tok, TP2 60.79 GiB/rank = 996K tok, ratio 2.264, DP2 total 880K
+  non-KV overhead TP1 3.5 GiB / TP2 4.1 GiB -> KV TP1 52.71 GiB = 432K tok, TP2 59.59 GiB/rank = 976K tok, ratio 2.261, DP2 total 864K
+  non-KV overhead TP1 4.82 GiB / TP2 5.4 GiB -> KV TP1 51.39 GiB = 421K tok, TP2 58.29 GiB/rank = 955K tok, ratio 2.269, DP2 total 842K
+  non-KV overhead TP1 6.0 GiB / TP2 7.0 GiB -> KV TP1 50.21 GiB = 411K tok, TP2 56.69 GiB/rank = 929K tok, ratio 2.258, DP2 total 823K
+
+== pessimistic large-message comm (beta=150 GB/s, per scaling-book 58MB/8xH100 figure)
+  prefill N=  512: TP1   12.15 ms  TP2    8.90 ms (AR  2.14 ms) speedup 1.36 eff 68.2%
+  prefill N= 2048: TP1   48.26 ms  TP2   32.93 ms (AR  7.60 ms) speedup 1.47 eff 73.3%
+  prefill N= 8192: TP1  223.61 ms  TP2  144.52 ms (AR 29.41 ms) speedup 1.55 eff 77.4%
+
+== central, mean decode context 1152 (input 1024, 256 outputs)
+  decode B=  1 ctx=1152: TP1   5.85 ms  TP2   3.76 ms  speedup 1.56  eff 77.8%
+  decode B=  8 ctx=1152: TP1   6.21 ms  TP2   3.95 ms  speedup 1.57  eff 78.5%
+  decode B= 32 ctx=1152: TP1   7.41 ms  TP2   4.60 ms  speedup 1.61  eff 80.5%
+  decode B=128 ctx=1152: TP1  12.25 ms  TP2   7.20 ms  speedup 1.70  eff 85.0%
+anchor TP1=6.32ms, bw=2.7: implied o=0.71 ms -> TP2 3.95 ms, speedup 1.60
+anchor TP1=6.32ms, bw=3.0: implied o=1.27 ms -> TP2 4.23 ms, speedup 1.49

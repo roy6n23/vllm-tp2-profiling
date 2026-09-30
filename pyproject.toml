@@ -1,0 +1,23 @@
+[project]
+name = "vllm-tp2-profiling"
+version = "0.1.0"
+license = "MIT"
+description = "What does the second H100 buy? TP=2 vs DP=2 profiling of vLLM 0.30.0 on Llama-3.1-8B"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "psutil>=5.9"]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.7"]
+test = ["pytest>=8", "matplotlib>=3.7"]
+
+[tool.setuptools]
+packages = ["tpprof"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-m 'not contract' -p no:cacheprovider"
+markers = [
+  "contract: needs the real vLLM 0.30.0 CLI (run inside docker/contract.Dockerfile)",
+  "slow: end-to-end dry runs",
+]
