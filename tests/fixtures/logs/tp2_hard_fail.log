@@ -1,0 +1,35 @@
+(APIServer pid=4101) INFO 09-30 10:00:00 [api_utils.py:286] non-default args: {'model_tag': '/models/llama', 'host': '127.0.0.1', 'port': 8000, 'model': '/models/llama', 'dtype': 'bfloat16', 'max_model_len': 9216, 'generation_config': 'vllm', 'served_model_name': ['llama-3.1-8b-instruct'], 'distributed_executor_backend': 'mp', 'tensor_parallel_size': 2, 'block_size': 16, 'gpu_memory_utilization': 0.9, 'enable_prefix_caching': False, 'max_num_batched_tokens': 8192, 'max_num_seqs': 1024, 'enable_chunked_prefill': True, 'async_scheduling': True}
+(APIServer pid=4101) INFO 09-30 10:00:01 [model.py:692] Resolved architecture: LlamaForCausalLM
+(APIServer pid=4101) INFO 09-30 10:00:02 [model.py:2030] Using max model len 9216
+(APIServer pid=4101) INFO 09-30 10:00:03 [scheduler.py:288] Chunked prefill is enabled with max_num_batched_tokens=8192.
+(APIServer pid=4101) INFO 09-30 10:00:04 [compilation.py:337] Enabled custom fusions: allreduce_rms
+(EngineCore pid=4230) INFO 09-30 10:00:05 [core.py:122] Initializing a V1 LLM engine (v0.30.0) with config: model='/models/llama', speculative_config=None, tokenizer='/models/llama', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=9216, download_dir=None, load_format=auto, tensor_parallel_size=2, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto'), observability_config=ObservabilityConfig(collect_detailed_traces=None), seed=0, served_model_name=llama-3.1-8b-instruct, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'custom_ops': ['none'], 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 128, 256, 512], 'pass_config': {'fuse_allreduce_rms': True}, 'max_cudagraph_capture_size': 512}, kernel_config=KernelConfig()
+(Worker pid=4301) INFO 09-30 10:00:06 [parallel_state.py:1827] world_size=2 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:41231 backend=nccl
+(Worker pid=4302) INFO 09-30 10:00:07 [parallel_state.py:1827] world_size=2 rank=1 local_rank=1 distributed_init_method=tcp://127.0.0.1:41231 backend=nccl
+(Worker pid=4301) INFO 09-30 10:00:08 [pynccl.py:148] vLLM is using nccl==2.30.7
+(Worker pid=4301) INFO 09-30 10:00:09 [cuda_communicator.py:319] Using ['FLASHINFER', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0' out of potential backends: ['FLASHINFER_PCIE_IPC', 'FLASHINFER', 'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+(Worker pid=4301) INFO 09-30 10:00:10 [parallel_state.py:2279] rank 0 in world size 2 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank 0
+(Worker pid=4301) INFO 09-30 10:00:11 [gpu_worker.py:441] Using V2 Model Runner
+(Worker_TP0 pid=4301) INFO 09-30 10:00:12 [cuda.py:478] Using AttentionBackendEnum.FLASH_ATTN backend.
+(Worker_TP1 pid=4302) INFO 09-30 10:00:13 [cuda.py:478] Using AttentionBackendEnum.FLASH_ATTN backend.
+(Worker_TP0 pid=4301) INFO 09-30 10:00:14 [flash_attn.py:1117] Using FlashAttention version 3
+(Worker_TP0 pid=4301) INFO 09-30 10:00:15 [model_runner.py:396] Loading model from scratch...
+(Worker_TP0 pid=4301) INFO 09-30 10:00:16 [model_runner.py:432] Loading weights took 5.02 seconds
+(Worker_TP0 pid=4301) INFO 09-30 10:00:17 [model_runner.py:429] Model loading took 7.51 GiB memory and 6.543210 seconds
+(Worker_TP1 pid=4302) INFO 09-30 10:00:18 [model_runner.py:429] Model loading took 7.51 GiB memory and 6.601234 seconds
+(Worker_TP0 pid=4301) ERROR 09-30 10:00:19 [flashinfer_all_reduce.py:222] Failed to initialize FlashInfer Allreduce norm fusion workspace with backend=mnnvl
+(Worker_TP0 pid=4301) INFO 09-30 10:00:20 [gpu_worker.py:641] Available KV cache memory: 58.29 GiB
+(EngineCore pid=4230) INFO 09-30 10:00:21 [kv_cache_utils.py:2395] GPU KV cache size: 955,000 tokens, Maximum concurrency for 9,216 tokens per request: 103.62x
+(Worker_TP0 pid=4301) INFO 09-30 10:00:22 [model_runner.py:1067] Graph capturing finished in 3 secs, took 0.61 GiB
+(Worker_TP1 pid=4302) INFO 09-30 10:00:23 [model_runner.py:1067] Graph capturing finished in 3 secs, took 0.61 GiB
+(Worker_TP0 pid=4301) INFO 09-30 10:00:24 [model_runner.py:1067] Graph capturing finished in 14 secs, took 0.61 GiB
+(Worker_TP1 pid=4302) INFO 09-30 10:00:25 [model_runner.py:1067] Graph capturing finished in 14 secs, took 0.61 GiB
+(EngineCore pid=4230) INFO 09-30 10:00:26 [core.py:372] init engine (profile, create kv cache, warmup model) took 61.23 s (compilation: 20.12 s)
+(APIServer pid=4101) INFO 09-30 10:00:27 [api_utils.py:139] Supported tasks: ['generate']
+(APIServer pid=4101) INFO 09-30 10:00:28 [entry.py:135] Starting vLLM server on http://127.0.0.1:8000
+(APIServer pid=4101) INFO 09-30 10:00:29 [entry.py:139] Available routes are:
+(APIServer pid=4101) INFO 09-30 10:00:30 [entry.py:139] Route: /health, Methods: GET
+(APIServer pid=4101) INFO 09-30 10:00:31 [entry.py:139] Route: /metrics, Methods: GET
+(APIServer pid=4101) INFO:     Started server process [4101]
+(APIServer pid=4101) INFO:     Waiting for application startup.
+(APIServer pid=4101) INFO:     Application startup complete.
