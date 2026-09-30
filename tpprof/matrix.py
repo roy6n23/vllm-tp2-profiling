@@ -17,8 +17,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from tpprof import engine, model
 from tpprof.constants import (
@@ -52,15 +54,9 @@ TIERS = ("P0", "P1", "P2")
 DP2RAND = "DP2rand"
 DP2RAND_ENGINES = ("DP2rand0", "DP2rand1")
 ONLINE_CONFIGS = ("TP1", "TP2", "DP2")
-
-# Mirrors of Task 12's vendored.M2_TOKENS and comm_bench.VARIANTS (AM31, spec 4.6), which are not
-# importable from this module's base; tests/test_matrix.py cross-checks them once both exist.
-M2_TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
-M3_VARIANTS = ((None, None), ("ring", "LL"), ("ring", "LL128"), ("ring", "Simple"),
-               ("tree", "LL"), ("tree", "LL128"), ("tree", "Simple"), ("nvls", "Simple"))
 M3_MODES = "eager,graph"
 
-# Estimator minutes (AM21).
+# Estimator minutes and seconds, exactly as plan Task 15 renders AM21.
 START_MIN, FIRST_START_MIN = 1.5, 3.0
 FIXED_MIN = {"preflight": 1.0, "envcapture": 1.0, "comm_m1": 4.0, "comm_m2": 4.0, "comm_m4": 10.0,
              "tokbench": 2.0, "trace": 2.5}
@@ -68,6 +64,79 @@ COMM_M3_MIN = 3.0
 SMOKE_MIN = 2.0
 RUN_OVERHEAD_S = 20.0            # per client run: health, /metrics scrapes, result write
 DEFAULT_PRICE_PER_HOUR = 6.98
+
+
+# ---------------------------------------------------------------- names owned by other tasks
+# M2_TOKENS (Task 12, tpprof.vendored), VARIANTS (Task 12, tpprof.comm_bench) and parse_points
+# (Task 11, tpprof.offline) are imported from their owners. The fallbacks below apply only while an
+# owner module is absent from the tree; any other import error propagates. tests/test_matrix.py
+# fails, rather than skips, once an owner module exists and the import does not resolve to it.
+
+try:
+    from tpprof.vendored import M2_TOKENS
+except ModuleNotFoundError as exc:
+    if exc.name != "tpprof.vendored":
+        raise
+    M2_TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+try:
+    from tpprof.comm_bench import VARIANTS as M3_VARIANTS
+except ModuleNotFoundError as exc:
+    if exc.name != "tpprof.comm_bench":
+        raise
+    M3_VARIANTS = ((None, None), ("ring", "LL"), ("ring", "LL128"), ("ring", "Simple"),
+                   ("tree", "LL"), ("tree", "LL128"), ("tree", "Simple"), ("nvls", "Simple"))
+
+
+class _Point(NamedTuple):
+    """The fields of Task 11's offline.Point that the estimator reads."""
+    kind: str
+    batch: int
+    input_len: int
+    output_len: int
+    warmup: int
+    iters: int
+
+
+def _fallback_parse_points(spec: str) -> list[_Point]:
+    """Task 11's offline.parse_points grammar, used only while tpprof/offline.py is absent:
+    `all`, or `;`-separated sections `prefill`, `decode`, `decode:b1,b32`, `prefill:2048`.
+    Duplicates are dropped, first occurrence wins."""
+    def prefill(n: int) -> _Point:
+        return _Point("prefill", 1, n, 1, PREFILL_WARMUP, PREFILL_ITERS)
+
+    def decode(b: int) -> list[_Point]:
+        return [_Point("decode", b, DECODE_INPUT_LEN, n, DECODE_WARMUP, DECODE_ITERS) for n in (DECODE_L1, DECODE_L2)]
+
+    defaults = [prefill(n) for n in PREFILL_LENS] + [p for b in DECODE_BATCHES for p in decode(b)]
+    spec = spec.strip()
+    if spec == "all":
+        return defaults
+    points: list[_Point] = []
+    for section in spec.split(";"):
+        section = section.strip()
+        kind, sep, items = section.partition(":")
+        if kind not in ("prefill", "decode"):
+            raise ValueError(f"point spec {spec!r}: section {section!r} must start with one of ('prefill', 'decode')")
+        if not sep:
+            points += [p for p in defaults if p.kind == kind]
+            continue
+        for item in items.split(","):
+            item = item.strip()
+            mt = re.fullmatch(r"b([0-9]+)" if kind == "decode" else r"([0-9]+)", item)
+            if not mt or int(mt[1]) < 1:
+                form = "b<batch>, e.g. b32" if kind == "decode" else "<input_len>, e.g. 2048"
+                raise ValueError(f"point spec {spec!r}: {kind} item {item!r} is not {form}")
+            points += decode(int(mt[1])) if kind == "decode" else [prefill(int(mt[1]))]
+    return list(dict.fromkeys(points))
+
+
+try:
+    from tpprof.offline import parse_points
+except ModuleNotFoundError as exc:
+    if exc.name != "tpprof.offline":
+        raise
+    parse_points = _fallback_parse_points
 
 
 def _freeze(value: object) -> object:
@@ -180,11 +249,18 @@ def p1_sweep_specs(grid: Mapping[str, Sequence[float]], rounds: int = ROUNDS) ->
     return specs
 
 
-def p2_specs(grid: Mapping[str, Sequence[float]] | None, fi_backend: str | None) -> list[RunSpec]:
+def p2_specs(grid: Mapping[str, Sequence[float]] | None, fi_backend: str | None,
+             multicast: bool | None = None) -> list[RunSpec]:
     """P2 ablations (spec 4.7). The A-PC and A-RAND sessions need the rate grid and are left out
-    when `grid` is None. A-FIB and the NVLS M3 variant need multicast, i.e. `fi_backend == "mnnvl"`."""
+    when `grid` is None. A-FIB runs only if `fi_backend == "mnnvl"` (R11).
+
+    The NVLS M3 variant runs only if multicast is present (spec 4.6), which is the preflight's
+    multicast attribute (spec 7.5). If `multicast` is None (not probed), `fi_backend == "mnnvl"`
+    stands in for it: vLLM keeps mnnvl exactly when the NVSwitch multicast workspace can be created
+    (spec 3, AM4)."""
     t = "P2"
     mnnvl = fi_backend == "mnnvl"
+    nvls = mnnvl if multicast is None else bool(multicast)
     offline = [("TP2", "AR1", "decode:b1,b32,b128;prefill:2048"),
                ("TP2", "AR2", "decode:b1,b32,b128;prefill:2048"),
                ("TP2", "AR3", "decode:b128;prefill:2048"),
@@ -205,14 +281,15 @@ def p2_specs(grid: Mapping[str, Sequence[float]] | None, fi_backend: str | None)
                              {"phase": "sweep", "rates": tuple(grid["DP2"]), "seed_base": 1000}, round=1))
     specs += [RunSpec("serve_session", c, "API2", t, _sat_params()) for c in ("TP2", "DP2")]
     specs.append(_none("comm_m1", t))
-    specs += [_none("comm_m3", t, variant=_render_variant(algo, proto), modes=M3_MODES, diagnostic=True)
-              for algo, proto in M3_VARIANTS[1:] if algo != "nvls" or mnnvl]
+    specs += [_none("comm_m3", t, variant=_render_variant(algo, proto), modes=M3_MODES)
+              for algo, proto in M3_VARIANTS[1:] if algo != "nvls" or nvls]
     specs.append(_none("comm_m4", t))
     return specs
 
 
 def build_matrix(tiers: Iterable[str], grid: Mapping[str, Sequence[float]] | None = None,
-                 fi_backend: str | None = None, rounds: int = ROUNDS) -> list[RunSpec]:
+                 fi_backend: str | None = None, rounds: int = ROUNDS,
+                 multicast: bool | None = None) -> list[RunSpec]:
     """The specs of `tiers`, always in P0, P1, P2 order. Without a grid, P1 holds only its
     saturation part and P2 drops its grid-dependent sessions."""
     wanted = set(tiers)
@@ -227,7 +304,7 @@ def build_matrix(tiers: Iterable[str], grid: Mapping[str, Sequence[float]] | Non
         if grid is not None:
             specs += p1_sweep_specs(grid, rounds)
     if "P2" in wanted:
-        specs += p2_specs(grid, fi_backend)
+        specs += p2_specs(grid, fi_backend, multicast)
     return specs
 
 
@@ -265,37 +342,6 @@ class Estimate:
     minutes: float
 
 
-# (kind, batch, input_len, output_len, warmup, iters), the fields of Task 11's offline.Point
-PointTuple = tuple[str, int, int, int, int, int]
-
-
-def _prefill_point(n: int) -> PointTuple:
-    return ("prefill", 1, n, 1, PREFILL_WARMUP, PREFILL_ITERS)
-
-
-def _decode_points(batch: int) -> list[PointTuple]:
-    return [("decode", batch, DECODE_INPUT_LEN, out, DECODE_WARMUP, DECODE_ITERS) for out in (DECODE_L1, DECODE_L2)]
-
-
-def _parse_points(spec: str) -> list[PointTuple]:
-    """Offline point spec, as Task 11's offline.parse_points reads it: "all", "prefill", "decode",
-    or ";"-joined groups like "decode:b1,b32;prefill:2048"."""
-    points: list[PointTuple] = []
-    for group in spec.split(";"):
-        kind, _, items = group.strip().partition(":")
-        if kind == "all" and not items:
-            points += [_prefill_point(n) for n in PREFILL_LENS]
-            points += [p for b in DECODE_BATCHES for p in _decode_points(b)]
-        elif kind == "prefill":
-            points += [_prefill_point(int(x)) for x in (items.split(",") if items else PREFILL_LENS)]
-        elif kind == "decode":
-            batches = [int(x.strip().removeprefix("b")) for x in items.split(",")] if items else DECODE_BATCHES
-            points += [p for b in batches for p in _decode_points(b)]
-        else:
-            raise ValueError(f"bad offline point spec {spec!r}: group {group!r}")
-    return points
-
-
 def _ar_path(arm: str) -> str:
     return "nccl_unfused" if arm == "AR3" else "fused"
 
@@ -310,8 +356,10 @@ def _generate_s(tp: int, arm: str, batch: int, input_len: int, output_len: int) 
     return t
 
 
-def _points_s(tp: int, arm: str, points: Sequence[PointTuple]) -> float:
-    return sum((w + i) * _generate_s(tp, arm, b, n, out) for _, b, n, out, w, i in points)
+def _points_s(tp: int, arm: str, spec: str) -> float:
+    """Offline: sum over points of (warmup + iters) x model latency."""
+    return sum((p.warmup + p.iters) * _generate_s(tp, arm, p.batch, p.input_len, p.output_len)
+               for p in parse_points(spec))
 
 
 def _engine_shape(config: str) -> tuple[int, int]:
@@ -322,12 +370,12 @@ def _engine_shape(config: str) -> tuple[int, int]:
     return cfg.tp, cfg.dp
 
 
-def _warmup_s(config: str) -> float:
-    """What `vllm bench serve` does before measuring: one ready-check request, then NUM_WARMUPS
-    warmup requests sent concurrently (vllm/benchmarks/serve.py:888-907), spread over the engines."""
+def _warmups_s(config: str) -> float:
+    """The NUM_WARMUPS warmup requests of a sweep run. `vllm bench serve` sends them concurrently
+    (vllm/benchmarks/serve.py:888-907, no semaphore without --max-concurrency), so they take one
+    generate() of NUM_WARMUPS / engines requests."""
     tp, engines = _engine_shape(config)
-    ready = _generate_s(tp, "base", 1, ONLINE_INPUT_LEN, ONLINE_OUTPUT_LEN)
-    return ready + _generate_s(tp, "base", max(1, NUM_WARMUPS // engines), ONLINE_INPUT_LEN, ONLINE_OUTPUT_LEN)
+    return _generate_s(tp, "base", max(1, NUM_WARMUPS // engines), ONLINE_INPUT_LEN, ONLINE_OUTPUT_LEN)
 
 
 def _mu(config: str, mu_rps: Mapping[str, float] | None) -> float:
@@ -337,15 +385,14 @@ def _mu(config: str, mu_rps: Mapping[str, float] | None) -> float:
     return model_mu_rps()[key]
 
 
-def _client_run_s(config: str, work_s: float) -> float:
-    """One `vllm bench serve` run: its measured work plus overhead and warmups (AM21)."""
-    return work_s + RUN_OVERHEAD_S + _warmup_s(config)
+def _sat_run_s(mu: float, num_prompts: int = SAT_NUM_PROMPTS) -> float:
+    """One saturation run: num_prompts / mu + 20 s."""
+    return num_prompts / mu + RUN_OVERHEAD_S
 
 
-def _rate_work_s(rate: float, mu: float) -> float:
-    """A fixed-rate run: arrivals over max(window, N / rate), or the drain N / mu if longer."""
-    n = num_prompts_for(rate)
-    return max(SWEEP_WINDOW_S, n / rate, n / mu)
+def _rate_run_s(config: str, rate: float, mu: float) -> float:
+    """One fixed-rate run: max(90 s, N / mu) + 20 s + the warmups."""
+    return max(SWEEP_WINDOW_S, num_prompts_for(rate) / mu) + RUN_OVERHEAD_S + _warmups_s(config)
 
 
 def _work_min(s: RunSpec, mu_rps: Mapping[str, float] | None) -> float:
@@ -355,46 +402,45 @@ def _work_min(s: RunSpec, mu_rps: Mapping[str, float] | None) -> float:
     if s.kind == "comm_m3":
         return COMM_M3_MIN
     if s.kind == "smoke":
-        return SMOKE_MIN + (_points_s(1, "base", _parse_points("decode:b1")) / 60 if s.p("gpu1_check") else 0.0)
+        return SMOKE_MIN + (_points_s(1, "base", "decode:b1") / 60 if s.p("gpu1_check") else 0.0)
     tp = _engine_shape(s.config)[0]
     if s.kind == "offline":
-        return _points_s(tp, s.arm, _parse_points(str(s.p("points")))) / 60
+        return _points_s(tp, s.arm, str(s.p("points"))) / 60
     if s.kind == "bench_latency_xcheck":
         x = XCHECK
         return (x["warmup"] + x["iters"]) * _generate_s(tp, s.arm, x["batch"], x["input_len"], x["output_len"]) / 60
     if s.kind == "serve_session":
         mu = _mu(s.config, mu_rps)
         phase = s.p("phase")
-        sat_s = _client_run_s(s.config, SAT_NUM_PROMPTS / mu)
         if phase == "sat":
-            return len(s.p("seeds")) * sat_s / 60
+            return len(s.p("seeds")) * _sat_run_s(mu, int(s.p("num_prompts", SAT_NUM_PROMPTS))) / 60
         if phase == "sweep":
-            return sum(_client_run_s(s.config, _rate_work_s(r, mu)) for r in s.p("rates")) / 60
+            return sum(_rate_run_s(s.config, r, mu) for r in s.p("rates")) / 60
         if phase == "pc":
-            rate_s = _client_run_s(s.config, _rate_work_s(s.p("rate"), mu))
-            return (s.p("repeats") * rate_s + s.p("sat_extra") * sat_s) / 60
+            return (s.p("repeats") * _rate_run_s(s.config, s.p("rate"), mu) + s.p("sat_extra") * _sat_run_s(mu)) / 60
         raise ValueError(f"{s.run_id}: unknown serve_session phase {phase!r}")
     raise ValueError(f"no estimate for kind {s.kind!r}")
 
 
 def _starts(s: RunSpec) -> int:
-    """Engine lifetimes a spec starts; the TP1 smoke adds the GPU1 offline check (AM14)."""
+    """Engine starts of a spec; the TP1 smoke adds the GPU1 offline check (AM14). The two DP2rand
+    servers start concurrently on separate GPUs, so they count as one start of wall time."""
     if s.kind in NO_ENGINE_KINDS:
         return 0
     return 2 if s.kind == "smoke" and s.p("gpu1_check") else 1
 
 
 def estimate(specs: Sequence[RunSpec], mu_rps: Mapping[str, float] | None = None) -> list[Estimate]:
-    """Minutes per spec (AM21), in order. Each engine start costs START_MIN, or FIRST_START_MIN for
-    the first start of an engine config (name and arm, as in C1) in `specs`: an arm's first start
-    compiles and captures graphs cold. mu_rps (req/s) defaults to the central model."""
-    seen: set[tuple[str, str]] = set()
+    """Minutes per spec, in order (AM21, as plan Task 15 gives it). Each engine start costs
+    START_MIN, or FIRST_START_MIN for the first start of a config (the RunSpec config, whatever the
+    arm) in `specs`. mu_rps (req/s) defaults to the central model."""
+    seen: set[str] = set()
     out = []
     for s in specs:
         minutes = _work_min(s, mu_rps)
         for _ in range(_starts(s)):
-            minutes += START_MIN if (s.config, s.arm) in seen else FIRST_START_MIN
-            seen.add((s.config, s.arm))
+            minutes += START_MIN if s.config in seen else FIRST_START_MIN
+            seen.add(s.config)
         out.append(Estimate(s.run_id, s.kind, s.tier, minutes))
     return out
 

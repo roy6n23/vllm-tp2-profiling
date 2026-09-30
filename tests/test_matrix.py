@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -202,6 +204,18 @@ def test_fibtrtllm_and_nvls_only_with_mnnvl():
     assert find(specs, "comm_m3", variant="nvls:Simple")
 
 
+def test_nvls_variant_is_gated_on_the_multicast_probe():
+    # Spec 4.6: the NVLS M3 variant runs only if multicast is present; A-FIB still follows fi_backend.
+    specs = m.p2_specs(MODEL_GRID, "trtllm", multicast=True)
+    assert find(specs, "comm_m3", variant="nvls:Simple")
+    assert not [s for s in specs if s.arm == "FIBtrtllm"]
+    specs = m.p2_specs(MODEL_GRID, "mnnvl", multicast=False)
+    assert not find(specs, "comm_m3", variant="nvls:Simple")
+    assert [s for s in specs if s.arm == "FIBtrtllm"]
+    full = m.build_matrix(["P2"], grid=MODEL_GRID, fi_backend=None, multicast=True)
+    assert find(full, "comm_m3", variant="nvls:Simple")
+
+
 def test_p2_contents():
     grid = {"TP1": [1.0], "TP2": [2.0, 4.0, 6.0, 7.5, 8.5, 9.5], "DP2": [3.0, 5.0]}
     p2 = m.p2_specs(grid, "mnnvl")
@@ -235,7 +249,8 @@ def test_p2_contents():
     assert all(dict(s.params) == {"phase": "sat", "seeds": (1, 2, 3), "num_prompts": 3000} for s in api2)
     m3 = [s.p("variant") for s in p2 if s.kind == "comm_m3"]
     assert m3 == ["ring:LL", "ring:LL128", "ring:Simple", "tree:LL", "tree:LL128", "tree:Simple", "nvls:Simple"]
-    assert all(s.p("diagnostic") is True for s in p2 if s.kind == "comm_m3")
+    assert all(set(dict(s.params)) == {"variant", "modes"} and s.p("modes") == "eager,graph"
+               for s in p2 if s.kind == "comm_m3")
     assert find(p2, "comm_m1") and find(p2, "comm_m4")
 
 
@@ -287,11 +302,17 @@ def test_model_mu_rps_uses_central_saturation():
 
 # ---------------------------------------------------------------- estimator
 
-def test_estimate_full_matrix_is_between_6_and_11_hours():
-    ests = m.estimate(full_matrix())
+@pytest.mark.parametrize("fi_backend", ["mnnvl", None])
+def test_estimate_full_matrix_within_budget(fi_backend):
+    # Upper bound: the brief's 11 h (11 h x $6.98 = $76.8, under the $80 cap). Lower bound: 5 h, not
+    # the brief's 6 h. The brief's own formulas give 5.69 h (5.58 h without mnnvl) with the central
+    # model; 6 h came from AM21's hand figures (P0 1.8 + P1 2.8 + P2 2.3 h), which the formulas do
+    # not reproduce. The formulas themselves are pinned term by term by the tests below.
+    specs = full_matrix(fi_backend)
+    ests = m.estimate(specs)
     total_h = sum(e.minutes for e in ests) / 60
-    assert 6 <= total_h <= 11, total_h
-    assert [e.run_id for e in ests] == [s.run_id for s in full_matrix()]
+    assert 5 <= total_h <= 11, total_h
+    assert [e.run_id for e in ests] == [s.run_id for s in specs]
     assert all(e.minutes > 0 for e in ests)
 
 
@@ -306,48 +327,60 @@ def test_estimate_fixed_costs_and_first_starts():
     # smoke: 2 + first start of the config (3.0); TP1 adds a GPU1 engine start (1.5) and its bs-1 point
     assert by[("smoke", "TP2", "base", None)] == pytest.approx(5.0)
     assert by[("smoke", "DP2", "base", None)] == pytest.approx(5.0)
-    assert by[("smoke", "TP1", "base", None)] > 6.5
+    gpu1_point = m._points_s(1, "base", "decode:b1") / 60
+    assert by[("smoke", "TP1", "base", None)] == pytest.approx(2.0 + 3.0 + 1.5 + gpu1_point)
     # trace: 2.5 + a later start (1.5)
     assert by[("trace", "TP2", "base", "decode:b1")] == pytest.approx(4.0)
+    # TP2 AR3 is not the first start of config TP2 (the TP2 smoke was)
+    assert by[("offline", "TP2", "AR3", "decode:b1,b32")] == pytest.approx(
+        1.5 + m._points_s(2, "AR3", "decode:b1,b32") / 60)
 
 
 def test_estimate_serve_session_formulas():
-    mu = {"TP1": 40.0, "TP2": 60.0, "DP2": 80.0}
+    mu = {"TP1": 30.0, "TP2": 60.0, "DP2": 80.0}
+    # sat: 3 x (3000 / mu + 20 s), nothing else
     sat = m.RunSpec("serve_session", "TP2", "base", "P1", {"phase": "sat", "seeds": [1, 2, 3], "num_prompts": 3000})
     [e] = m.estimate([sat], mu)
-    sat_run = 3000 / 60.0 + 20 + m._warmup_s("TP2")
-    assert e.minutes == pytest.approx(3.0 + 3 * sat_run / 60)
-    sweep = m.RunSpec("serve_session", "TP1", "base", "P1", {"phase": "sweep", "rates": [8.0, 38.0],
+    assert e.minutes == pytest.approx(3.0 + 3 * (3000 / 60.0 + 20) / 60)
+    # sweep: per rate max(90, N / mu) + 20 s + 16 warmups; 38 req/s drains (3420 / 30 = 114 s > 90 s)
+    sweep = m.RunSpec("serve_session", "TP1", "base", "P1", {"phase": "sweep", "rates": [1.0, 8.0, 38.0],
                                                            "seed_base": 1000}, round=1)
     [e] = m.estimate([sweep], mu)
-    warm = m._warmup_s("TP1")
-    per_rate = [max(90, m.num_prompts_for(r) / 40.0) + 20 + warm for r in (8.0, 38.0)]
+    warm = m._warmups_s("TP1")
+    per_rate = [90 + 20 + warm, 90 + 20 + warm, 3420 / 30.0 + 20 + warm]
     assert e.minutes == pytest.approx(3.0 + sum(per_rate) / 60)
-    assert 0 < warm < 30
+    # pc: repeats fixed-rate runs plus sat_extra sat runs
     pc = m.RunSpec("serve_session", "TP2", "PCon", "P2", {"phase": "pc", "rate": 36.0, "repeats": 3, "sat_extra": 1})
     [e] = m.estimate([pc], mu)
-    rate_run = max(90, m.num_prompts_for(36.0) / 60.0) + 20 + m._warmup_s("TP2")
-    assert e.minutes == pytest.approx(3.0 + (3 * rate_run + sat_run) / 60)
+    rate_run = max(90, m.num_prompts_for(36.0) / 60.0) + 20 + m._warmups_s("TP2")
+    assert e.minutes == pytest.approx(3.0 + (3 * rate_run + 3000 / 60.0 + 20) / 60)
 
 
-def test_estimate_low_rate_run_covers_the_min_prompts_arrival_window():
-    sweep = m.RunSpec("serve_session", "TP1", "base", "P1", {"phase": "sweep", "rates": [1.0], "seed_base": 1000},
-                      round=1)
-    [e] = m.estimate([sweep], {"TP1": 40.0})
-    assert e.minutes == pytest.approx(3.0 + (200 / 1.0 + 20 + m._warmup_s("TP1")) / 60)
+def test_warmups_are_one_concurrent_batch_split_over_the_engines():
+    c = model.CONSTANTS["central"]
+
+    def generate(tp, batch):
+        return batch * model.prefill_time(tp, 1024, c) + 255 * model.decode_step_time(tp, batch, 1024 + 128, c)
+
+    assert m._warmups_s("TP1") == pytest.approx(generate(1, 16))
+    assert m._warmups_s("TP2") == pytest.approx(generate(2, 16))
+    assert m._warmups_s("DP2") == pytest.approx(generate(1, 8))
+    assert m._warmups_s("DP2rand") == pytest.approx(generate(1, 8))
+    assert 0 < m._warmups_s("TP1") < 30
 
 
 def test_estimate_dp2rand_uses_the_dp2_mu():
     spec = m.RunSpec("serve_session", "DP2rand", "base", "P2", {"phase": "sat", "seeds": [1], "num_prompts": 3000})
     [e] = m.estimate([spec], {"DP2": 50.0})
-    assert e.minutes == pytest.approx(3.0 + (3000 / 50.0 + 20 + m._warmup_s("DP2rand")) / 60)
+    assert e.minutes == pytest.approx(3.0 + (3000 / 50.0 + 20) / 60)
 
 
-def test_first_start_is_per_engine_config():
+def test_first_start_is_per_config_not_per_arm():
     specs = [m.RunSpec("trace", "TP2", "base", "P0", {"points": "decode:b1"}),
              m.RunSpec("trace", "TP2", "base", "P0", {"points": "decode:b32"}),
-             m.RunSpec("trace", "TP2", "AR3", "P0", {"points": "decode:b1"})]
-    assert [e.minutes for e in m.estimate(specs)] == pytest.approx([5.5, 4.0, 5.5])
+             m.RunSpec("trace", "TP2", "AR3", "P0", {"points": "decode:b1"}),
+             m.RunSpec("trace", "TP1", "G2", "P0", {"points": "decode:b1"})]
+    assert [e.minutes for e in m.estimate(specs)] == pytest.approx([5.5, 4.0, 4.0, 5.5])
 
 
 def test_estimate_rejects_unknown_serve_phase():
@@ -366,9 +399,16 @@ def test_estimate_offline_sums_points_with_central_model():
     assert e.minutes == pytest.approx(3.0 + (decode + prefill) / 60)
 
 
-def test_estimate_offline_all_counts_default_points():
-    assert len(m._parse_points("all")) == 3 + 16
-    assert len(m._parse_points("decode:b1,b32;prefill:2048")) == 5
+def test_parse_points_follows_the_offline_driver_grammar():
+    # Task 11's offline.parse_points; the matrix's fallback copy must behave the same way.
+    assert len(m.parse_points("all")) == 3 + 16
+    assert len(m.parse_points("decode:b1,b32;prefill:2048")) == 5
+    assert len(m.parse_points("decode:b1,b1;decode:b1")) == 2          # duplicates dropped
+    got = [(p.kind, p.batch, p.input_len, p.output_len, p.warmup, p.iters) for p in m.parse_points("decode:b32")]
+    assert got == [("decode", 32, 1024, 64, 3, 10), ("decode", 32, 1024, 320, 3, 10)]
+    for bad in ("decode:32", "decode:b0", "all;prefill", "bogus", "prefill:b2048"):
+        with pytest.raises(ValueError):
+            m.parse_points(bad)
 
 
 def test_format_estimate_lists_tiers_hours_cost_and_total():
@@ -384,20 +424,26 @@ def test_format_estimate_lists_tiers_hours_cost_and_total():
     assert f"${total_h * 10:.2f}" in m.format_estimate(ests, price_per_hour=10)
 
 
-# ---------------------------------------------------------------- cross-checks against parallel tasks
+# ---------------------------------------------------------------- names owned by other tasks
+# Once an owner module exists in the tree, matrix must import the name from it. These tests fail
+# (they do not skip) if the module exists but the name is not the owner's object.
 
-def test_m2_tokens_match_vendored():
-    vendored = pytest.importorskip("tpprof.vendored")
-    assert tuple(m.M2_TOKENS) == tuple(vendored.M2_TOKENS)
-
-
-def test_m3_variants_match_comm_bench():
-    comm_bench = pytest.importorskip("tpprof.comm_bench")
-    assert tuple(m.M3_VARIANTS) == tuple(comm_bench.VARIANTS)
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_points_parser_matches_offline_driver():
-    offline = pytest.importorskip("tpprof.offline")
-    for spec in ("all", "prefill", "decode", "decode:b1,b32,b128;prefill:2048", "decode:b1", "prefill:2048"):
-        want = [(p.kind, p.batch, p.input_len, p.output_len, p.warmup, p.iters) for p in offline.parse_points(spec)]
-        assert sorted(m._parse_points(spec)) == sorted(want), spec
+def owner(name: str):
+    if not (ROOT / "tpprof" / f"{name}.py").exists():
+        pytest.skip(f"tpprof/{name}.py is not in this tree yet; matrix uses its fallback copy")
+    return importlib.import_module(f"tpprof.{name}")
+
+
+def test_m2_tokens_come_from_vendored():
+    assert m.M2_TOKENS is owner("vendored").M2_TOKENS
+
+
+def test_m3_variants_come_from_comm_bench():
+    assert m.M3_VARIANTS is owner("comm_bench").VARIANTS
+
+
+def test_parse_points_comes_from_the_offline_driver():
+    assert m.parse_points is owner("offline").parse_points
