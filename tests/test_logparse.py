@@ -44,6 +44,7 @@ def test_tp2_mnnvl_fields():
     assert eff.chunked_prefill_tokens == 8192
     assert eff.v2_model_runner is True
     assert eff.attention_backend == "FLASH_ATTN"
+    assert eff.attention_explicit is True
     assert eff.flash_attn_version == 3
     assert eff.ar_backends == ["FLASHINFER", "CUSTOM", "SYMM_MEM", "PYNCCL"]
     assert eff.fusions_line == "allreduce_rms"
@@ -81,6 +82,23 @@ def test_line_glued_after_tqdm_without_newline():
              "failed: boom\n")
     eff = parse_engine_log(glued)
     assert eff.hard_failures == ["SymmMemCommunicator: symmetric memory initialization failed: boom"]
+
+
+def test_process_prefixes_do_not_change_the_parse():
+    # C6 describes TP1 lines under (EngineCore pid=...); with the AM2 `mp` pin they come from a plain `Worker`
+    # (multiproc_executor.py:1062-1095). Parsing is on the message only, so both shapes give the same result.
+    text = read("tp1_base.log")
+    as_engine_core = text.replace("(Worker pid=4301)", "(EngineCore pid=4230)")
+    assert as_engine_core != text
+    assert parse_engine_log(as_engine_core) == parse_engine_log(text)
+
+
+def test_exec_uni_fixture_fields():
+    eff = parse("tp1_exec_uni.log")
+    assert eff.executor == "uni"
+    assert eff.kv_cache_tokens == [420959]
+    assert eff.graph_capture == ["Graph capturing finished in 3 secs, took 0.52 GiB",
+                                 "Graph capturing finished in 18 secs, took 0.52 GiB"]
 
 
 def test_dp2_has_one_kv_line_per_engine():
@@ -189,9 +207,8 @@ def test_failure_string_lists_match_spec_am4():
     ("tp1_base.log", "DP2rand0", "base"),
     ("tp1_base.log", "DP2rand1", "base"),
     ("tp1_base.log", "TP1", "G1"),
-    ("tp1_base.log", "TP1", "EXECuni"),
+    ("tp1_exec_uni.log", "TP1", "EXECuni"),
     ("tp2_base_mnnvl.log", "TP2", "base"),
-    ("tp2_base_mnnvl.log", "TP2", "AR0"),
     ("tp2_base_mnnvl.log", "TP2", "G1"),
     ("tp2_base_mnnvl.log", "TP2", "PCon"),
     ("tp2_base_mnnvl.log", "TP2", "API2"),
@@ -238,7 +255,9 @@ def test_fibtrtllm_rejects_mnnvl():
 
 def test_dp2_log_fails_single_engine_expectation_and_vice_versa():
     one = check(parse("dp2_base.log"), expectation_for("TP1", "base", True))
-    assert len(one) == 1 and "GPU KV cache size:" in one[0] and "expected 1" in one[0]
+    # DP2 passes no executor flag, so the TP1 mp pin is also reported missing.
+    assert len(one) == 2 and "GPU KV cache size:" in one[0] and "expected 1" in one[0]
+    assert "'distributed_executor_backend': 'mp'" in one[1] and "found executor None" in one[1]
     two = check(parse("tp1_base.log"), expectation_for("DP2", "base", True))
     assert len(two) == 1 and "expected 2" in two[0]
 
@@ -282,11 +301,41 @@ def test_wrong_values_are_named():
         assert found in joined
 
 
-def test_auto_selected_attention_form_is_parsed():
-    text = read("tp1_base.log").replace(
-        "Using AttentionBackendEnum.FLASH_ATTN backend.",
-        "Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER'].")
-    assert parse_engine_log(text).attention_backend == "FLASH_ATTN"
+AUTO_ATTENTION = "Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER']."
+
+
+def test_auto_selected_attention_form_is_parsed_but_rejected():
+    # FLASH_ATTN is also the SM90 auto default (D5-12), so the auto form means --attention-backend was dropped.
+    text = read("tp1_base.log").replace("Using AttentionBackendEnum.FLASH_ATTN backend.", AUTO_ATTENTION)
+    eff = parse_engine_log(text)
+    assert eff.attention_backend == "FLASH_ATTN"
+    assert eff.attention_explicit is False
+    violations = check(eff, expectation_for("TP1", "base", True))
+    assert len(violations) == 1
+    assert 'missing line "Using AttentionBackendEnum.FLASH_ATTN backend."' in violations[0]
+    assert "auto-selection" in violations[0] and "--attention-backend was not applied" in violations[0]
+
+
+def test_auto_attention_line_next_to_explicit_one_is_rejected():
+    worker = "(Worker pid=4301) INFO 09-30 10:00:07 [cuda.py:539] "
+    eff = parse_engine_log(read("tp1_base.log") + worker + AUTO_ATTENTION + "\n")
+    assert eff.attention_explicit is False
+    violations = check(eff, expectation_for("TP1", "base", True))
+    assert len(violations) == 1 and "Using AttentionBackendEnum.FLASH_ATTN backend." in violations[0]
+
+
+def test_exec_uni_requires_uni_and_base_requires_mp():
+    uni = check(parse("tp1_base.log"), expectation_for("TP1", "EXECuni", True))
+    assert uni == ["expected \"'distributed_executor_backend': 'uni'\" in the \"non-default args:\" line "
+                   "(found executor mp)."]
+    mp = check(parse("tp1_exec_uni.log"), expectation_for("TP1", "base", True))
+    assert len(mp) == 1 and "'distributed_executor_backend': 'mp'" in mp[0] and "found executor uni" in mp[0]
+    for config in ("DP2rand0", "DP2rand1"):
+        assert len(check(parse("tp1_exec_uni.log"), expectation_for(config, "base", True))) == 1
+    tp2 = parse_engine_log(read("tp2_base_mnnvl.log").replace("'distributed_executor_backend': 'mp', ", ""))
+    assert tp2.executor is None
+    missing = check(tp2, expectation_for("TP2", "base", True))
+    assert len(missing) == 1 and "found executor None" in missing[0]
 
 
 def test_sampling_override_is_a_violation():
@@ -318,11 +367,14 @@ def test_empty_log_names_every_always_required_line():
 
 
 def test_expectation_for_configs():
-    assert expectation_for("TP1", "base", True) == Expectation(engines=1, serve=True, tp2=False)
+    assert expectation_for("TP1", "base", True) == Expectation(engines=1, serve=True, tp2=False, executor="mp")
+    assert expectation_for("TP1", "EXECuni", False) == Expectation(engines=1, serve=False, tp2=False, executor="uni")
     for rand in ("DP2rand0", "DP2rand1"):
-        assert expectation_for(rand, "base", False) == Expectation(engines=1, serve=False, tp2=False)
+        assert expectation_for(rand, "base", False) == Expectation(engines=1, serve=False, tp2=False, executor="mp")
+    # DP2 passes no --distributed-executor-backend (C1), so there is no executor value in its log to check.
     assert expectation_for("DP2", "base", True) == Expectation(engines=2, serve=True, tp2=False)
-    base = Expectation(engines=1, serve=True, tp2=True, ar_first="FLASHINFER", require_fi_workspace=True)
+    base = Expectation(engines=1, serve=True, tp2=True, ar_first="FLASHINFER", require_fi_workspace=True,
+                       executor="mp")
     assert expectation_for("TP2", "base", True) == base
     assert expectation_for("TP2", "AR2", True).ar_exact == (("CUSTOM", "PYNCCL"),)
     assert expectation_for("TP2", "AR3", True).ar_exact == (("PYNCCL",),)
@@ -332,7 +384,8 @@ def test_expectation_for_configs():
 
 
 @pytest.mark.parametrize("config, arm", [("TP3", "base"), ("TP1", "AR9"), ("TP1", "AR2"), ("DP2", "G2"),
-                                         ("TP2", "EXECuni"), ("DP2rand0", "G1")])
+                                         ("TP2", "EXECuni"), ("DP2rand0", "G1"),
+                                         ("TP2", "AR0")])
 def test_expectation_for_rejects_unknown_or_inapplicable(config, arm):
     with pytest.raises(ValueError, match=re.escape(repr(config if config == "TP3" else arm))):
         expectation_for(config, arm, True)

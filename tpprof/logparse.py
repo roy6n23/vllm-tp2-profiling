@@ -59,8 +59,10 @@ _KV = re.compile(r"(?P<dev>\w+) KV cache size: (?P<tok>[\d,]+) tokens, "
 _AVAILABLE_KV = re.compile(r"Available KV cache memory: (?P<g>[\d.]+) GiB")
 _MODEL_LOADING = re.compile(r"Model loading took (?P<g>[\d.]+) GiB memory")
 _CHUNKED = re.compile(r"Chunked prefill is enabled with max_num_batched_tokens=(?P<n>\d+)\.")
-_ATTENTION = (re.compile(r"Using AttentionBackendEnum\.(?P<b>[A-Z_]+) backend\."),
-              re.compile(r"Using (?P<b>[A-Z_]+) attention backend out of potential backends"))
+# Explicit form (--attention-backend applied, cuda.py:478) and auto-selection form (cuda.py:539-546). With the
+# explicit flag 0.30.0 prints only the first, so the second means the flag was not applied (AM5, D5-12).
+_ATTENTION_EXPLICIT = re.compile(r"Using AttentionBackendEnum\.(?P<b>[A-Z_]+) backend\.")
+_ATTENTION_AUTO = re.compile(r"Using (?P<b>[A-Z_]+) attention backend out of potential backends")
 _FA_VERSION = re.compile(r"Using FlashAttention version (?P<v>\d+)")
 _AR_LIST = re.compile(r"Using \[(?P<l>[^\]]*)\] all-reduce backends \(in dispatch order\) for group 'tp:0'")
 _AR_ITEM = re.compile(r"'([A-Z_]+)'")
@@ -81,6 +83,7 @@ class EffectiveConfig:
     chunked_prefill_tokens: int | None = None
     v2_model_runner: bool = False
     attention_backend: str | None = None                           # "FLASH_ATTN"
+    attention_explicit: bool = False    # every attention line seen was the explicit AM5 form (none auto-selected)
     flash_attn_version: int | None = None
     ar_backends: list[str] | None = None
     fusions_line: str | None = None
@@ -111,6 +114,7 @@ def _messages(text: str) -> list[str]:
 def parse_engine_log(text: str) -> EffectiveConfig:
     eff = EffectiveConfig()
     nondefault_executor = None
+    attention_forms: set[str] = set()
     for msg in _messages(text):
         if m := _BANNER.search(msg):
             if eff.vllm_version is None:
@@ -142,9 +146,10 @@ def parse_engine_log(text: str) -> EffectiveConfig:
             eff.jit_after_warmup.append(msg)
         elif FUSIONS_PREFIX in msg:
             eff.fusions_line = msg.split(FUSIONS_PREFIX, 1)[1]
-        for rx in _ATTENTION:
+        for form, rx in (("explicit", _ATTENTION_EXPLICIT), ("auto", _ATTENTION_AUTO)):
             if m := rx.search(msg):
                 eff.attention_backend = m.group("b")
+                attention_forms.add(form)
         eff.v2_model_runner |= V2_RUNNER in msg
         eff.enforce_eager |= ENFORCE_EAGER in msg
         eff.sampling_override |= SAMPLING_OVERRIDE in msg
@@ -153,6 +158,7 @@ def parse_engine_log(text: str) -> EffectiveConfig:
         eff.fi_backend_fallback |= any(s in msg for s in FALLBACK_WARNINGS)
         if any(s in msg for s in HARD_FAILURES):
             eff.hard_failures.append(msg)
+    eff.attention_explicit = attention_forms == {"explicit"}
     if eff.executor is None:
         # The real 0.30.0 banner has no executor field; the CLI input always carries it because the
         # flag's default is None (D5-8), and every config pins it (AM2).
@@ -170,13 +176,17 @@ class Expectation:
     require_fi_workspace: bool = False  # AR0, AR1, G1, PCon, FIBtrtllm, API2
     require_enforce_eager: bool = False # G2
     fi_backend_exact: str | None = None # FIBtrtllm: "trtllm"
+    executor: str | None = None         # pinned --distributed-executor-backend (AM2): "mp", or "uni" for EXECuni
 
 
-# Config -> (engines, tp2). DP2rand0/1 are single-engine TP1-like configs (ruling R6).
-_CONFIGS = {"TP1": (1, False), "DP2rand0": (1, False), "DP2rand1": (1, False), "TP2": (1, True), "DP2": (2, False)}
-# Arm -> configs it applies to (C1 arms table). "AR0" is the spec's name for the TP2 base arm (AM3).
+# Config -> (engines, tp2, pinned executor). DP2rand0/1 are single-engine TP1-like configs (ruling R6). C1 pins
+# `--distributed-executor-backend mp` for TP1, DP2rand0/1 and TP2 (AM2); DP2 passes no executor flag, so its
+# logs carry no executor value to check.
+_CONFIGS = {"TP1": (1, False, "mp"), "DP2rand0": (1, False, "mp"), "DP2rand1": (1, False, "mp"),
+            "TP2": (1, True, "mp"), "DP2": (2, False, None)}
+# Arm -> configs it applies to (C1 arms table; the TP2 base arm is the spec's AR0 and is named "base" here).
 _ARM_CONFIGS = {
-    "base": frozenset(_CONFIGS), "AR0": frozenset({"TP2"}),
+    "base": frozenset(_CONFIGS),
     "AR1": frozenset({"TP2"}), "AR2": frozenset({"TP2"}), "AR3": frozenset({"TP2"}),
     "G1": frozenset({"TP1", "TP2"}), "G2": frozenset({"TP1", "TP2"}), "PCon": frozenset({"TP2"}),
     "EXECuni": frozenset({"TP1"}), "FIBtrtllm": frozenset({"TP2"}), "API2": frozenset({"TP2", "DP2"}),
@@ -184,7 +194,6 @@ _ARM_CONFIGS = {
 # Per-arm TP2 expectations (AM3). G2's enforce-eager line is required for TP1 and TP2 alike.
 _TP2_ARMS = {
     "base": dict(ar_first="FLASHINFER", require_fi_workspace=True),
-    "AR0": dict(ar_first="FLASHINFER", require_fi_workspace=True),
     "AR1": dict(ar_first="FLASHINFER", require_fi_workspace=True),
     "AR2": dict(ar_exact=(("CUSTOM", "PYNCCL"),)),
     "AR3": dict(ar_exact=(("PYNCCL",),)),
@@ -203,11 +212,13 @@ def expectation_for(config: str, arm: str, serve: bool) -> Expectation:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(_ARM_CONFIGS)}")
     if config not in _ARM_CONFIGS[arm]:
         raise ValueError(f"arm {arm!r} does not apply to config {config!r}")
-    engines, tp2 = _CONFIGS[config]
+    engines, tp2, executor = _CONFIGS[config]
     extra = dict(_TP2_ARMS.get(arm, {})) if tp2 else {}
     if arm == "G2":
         extra["require_enforce_eager"] = True
-    return Expectation(engines=engines, serve=serve, tp2=tp2, **extra)
+    if arm == "EXECuni":
+        executor = "uni"
+    return Expectation(engines=engines, serve=serve, tp2=tp2, executor=executor, **extra)
 
 
 def _fmt(backends: list[str] | tuple[str, ...]) -> str:
@@ -222,9 +233,11 @@ def check(eff: EffectiveConfig, exp: Expectation) -> list[str]:
                  f"(found version {eff.vllm_version}).")
     if not eff.v2_model_runner:
         v.append(f'missing line "{V2_RUNNER}".')
-    if eff.attention_backend != EXPECTED_ATTENTION_BACKEND:
-        v.append(f'missing line "Using AttentionBackendEnum.{EXPECTED_ATTENTION_BACKEND} backend." '
-                 f"(found attention backend {eff.attention_backend}).")
+    if eff.attention_backend != EXPECTED_ATTENTION_BACKEND or not eff.attention_explicit:
+        found = (f"attention backend {eff.attention_backend}" if eff.attention_explicit or eff.attention_backend is None
+                 else f'the auto-selection line "Using {eff.attention_backend} attention backend out of potential '
+                      f'backends", so --attention-backend was not applied')
+        v.append(f'missing line "Using AttentionBackendEnum.{EXPECTED_ATTENTION_BACKEND} backend." (found {found}).')
     if eff.flash_attn_version != EXPECTED_FLASH_ATTN_VERSION:
         v.append(f'missing line "Using FlashAttention version {EXPECTED_FLASH_ATTN_VERSION}" '
                  f"(found version {eff.flash_attn_version}).")
@@ -243,6 +256,9 @@ def check(eff: EffectiveConfig, exp: Expectation) -> list[str]:
         v.append(f'unexpected line "{MRV2_FALLBACK}" (the engine fell back to the V1 model runner).')
     if exp.serve and not eff.startup_complete:
         v.append(f'missing line "{STARTUP_COMPLETE}".')
+    if exp.executor is not None and eff.executor != exp.executor:
+        v.append(f"expected \"'distributed_executor_backend': '{exp.executor}'\" in the \"non-default args:\" line "
+                 f"(found executor {eff.executor}).")
     if exp.require_enforce_eager and not eff.enforce_eager:
         v.append(f'missing line "{ENFORCE_EAGER}" (required by --enforce-eager).')
     if exp.tp2:
