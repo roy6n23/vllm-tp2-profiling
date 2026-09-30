@@ -338,6 +338,39 @@ def test_exec_uni_requires_uni_and_base_requires_mp():
     assert len(missing) == 1 and "found executor None" in missing[0]
 
 
+NONDEFAULT_HEADER = "(APIServer pid=4101) INFO 09-30 10:00:00 [api_utils.py:286] non-default args: "
+
+
+def with_nondefault_line(name: str, args: str) -> str:
+    lines = read(name).split("\n")
+    assert "non-default args: " in lines[0]
+    return "\n".join([NONDEFAULT_HEADER + args] + lines[1:])
+
+
+@pytest.mark.parametrize("name,config,arm", [
+    ("tp1_base.log", "TP1", "base"), ("tp1_base.log", "DP2rand0", "base"), ("tp1_base.log", "DP2rand1", "base"),
+    ("tp1_exec_uni.log", "TP1", "EXECuni"), ("tp2_base_mnnvl.log", "TP2", "base"), ("tp2_ar2.log", "TP2", "AR2"),
+])
+def test_placeholder_nondefault_line_fails_the_executor_pin(name, config, arm):
+    # A fake that prints C6's example line literally ("non-default args: {...}") carries no executor value, so
+    # the AM2 pin cannot be verified: exactly one violation, naming the key the line must contain.
+    eff = parse_engine_log(with_nondefault_line(name, "{...}"))
+    assert eff.executor is None
+    exp = expectation_for(config, arm, True)
+    assert check(eff, exp) == [f"expected \"'distributed_executor_backend': '{exp.executor}'\" in the "
+                               "\"non-default args:\" line (found executor None)."]
+
+
+@pytest.mark.parametrize("args", [
+    "{'model_tag': '/m', 'tensor_parallel_size': 2, 'distributed_executor_backend': 'mp'}",   # dict repr (real)
+    '{"model_tag": "/m", "tensor_parallel_size": 2, "distributed_executor_backend": "mp"}',   # JSON rendering
+])
+def test_executor_rendered_from_argv_in_either_quote_style(args):
+    eff = parse_engine_log(with_nondefault_line("tp2_base_mnnvl.log", args))
+    assert eff.executor == "mp"
+    assert check(eff, expectation_for("TP2", "base", True)) == []
+
+
 def test_sampling_override_is_a_violation():
     eff = parse("tp1_sampling_override.log")
     assert eff.sampling_override is True

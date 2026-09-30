@@ -53,7 +53,9 @@ _HEADER = re.compile(
     r"\[(?P<src>[^\]]+):(?P<ln>\d+)\] (?P<msg>.*)")
 _BANNER = re.compile(r"Initializing a V1 LLM engine \(v(?P<v>[^)]+)\) with config: (?P<cfg>.*)")
 _BANNER_EXECUTOR = re.compile(r"distributed_executor_backend=(\w+)")
-_NONDEFAULT_EXECUTOR = re.compile(r"non-default args: .*'distributed_executor_backend': '(\w+)'")
+# Real 0.30.0 logs the dict repr (single quotes, api_utils.py:286); a JSON-rendered dict (double quotes) is also
+# accepted so a fake that renders its argv either way parses the same.
+_NONDEFAULT_EXECUTOR = re.compile(r"""non-default args: .*['"]distributed_executor_backend['"]: ['"](\w+)['"]""")
 _KV = re.compile(r"(?P<dev>\w+) KV cache size: (?P<tok>[\d,]+) tokens, "
                  r"Maximum concurrency for (?P<len>[\d,]+) tokens per request: (?P<conc>[\d.]+)x")
 _AVAILABLE_KV = re.compile(r"Available KV cache memory: (?P<g>[\d.]+) GiB")
