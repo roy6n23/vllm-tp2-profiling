@@ -1,0 +1,16 @@
+host:1:2 [0] NCCL INFO NCCL version 2.30.7+cuda13.0
+host:1:2 [0] NCCL INFO NCCL_ALGO set by environment to allreduce:ring
+host:1:2 [0] NCCL INFO NCCL_PROTO set by environment to allreduce:LL
+host:1:2 [0] NCCL INFO NVLS multicast support is not available on dev 0 (NVLS_NCHANNELS 0)
+host:1:2 [0] NCCL INFO comm 0x55d0c3a1b2c0 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+host:1:2 [0] NCCL INFO Channel 00/02 : 0 1
+host:1:2 [0] NCCL INFO Channel 01/02 : 0 1
+host:1:2 [0] NCCL INFO 2 coll channels, 0 collnet channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+host:1:2 [0] NCCL INFO ncclCommInitRankConfig comm 0x55d0c3a1b2c0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 18000 commId 0x9f3c2a1b7d4e6f01 - Init COMPLETE
+host:1:2 [0] NCCL INFO AllReduce: 8192 Bytes -> Algo RING proto LL channel{Lo..Hi}={0..1}
+host:1:2 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM
+host:1:2 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] via P2P/CUMEM
+host:1:2 [0] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+host:1:2 [0] NCCL INFO AllReduce: 268435456 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+host:1:2 [0] NCCL INFO AllGather: 1026048 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+host:1:2 [0] NCCL INFO AllReduce [Symmetric]: 8192 Bytes -> Kernel AllReduce_AGxLL_R nchannels 2 nthreads 512 nWorks 1
