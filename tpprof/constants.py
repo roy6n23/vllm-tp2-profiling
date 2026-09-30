@@ -15,6 +15,8 @@ VLLM_IMAGE_TAG = "vllm/vllm-openai:v0.30.0"
 TORCH_VERSION = "2.13.0"
 TORCH_CUDA = "13.0"
 NCCL_EXPECTED = "2.30.7"
+# The FlashInfer JIT cache the pinned image installs (research_nccl-and-comm-microbench.md:54-56).
+FLASHINFER_JIT_CACHE = ("flashinfer-jit-cache", "0.6.18.post1")
 MIN_DRIVER_MAJOR = 580
 NSYS_VERSION = "2026.5.1"
 NSYS_DEFAULT_PATH = "/opt/nvidia/nsight-systems-cli/2026.5.1/target-linux-x64/nsys"
@@ -63,6 +65,7 @@ H100_SXM = GpuSpec("NVIDIA H100 80GB HBM3", 132, 3.352e12, 989.4e12, 700, 81559)
 H100_PCIE = GpuSpec("NVIDIA H100 PCIe", 114, 2.039e12, 756e12, 350, 81559)
 H100_NVL = GpuSpec("NVIDIA H100 NVL", 132, 3.938e12, 835.5e12, 400, 95830)
 NVLINK_DIR_BW = 450e9    # bytes/s per direction on H100 SXM (18 links x 25 GB/s)
+EXPECTED_LINK = "NV18"   # GPU0-GPU1 cell of `nvidia-smi topo -m` on an H100 SXM host
 
 
 @dataclass(frozen=True)
@@ -112,3 +115,5 @@ MIN_SHM_BYTES = 1 << 30
 MIN_DISK_BYTES = 60 * 10**9
 MIN_NOFILE_HARD = 8192
 GPU_FREE_MIB = 1024
+MIN_CPUS = 16               # soft
+MIN_RAM_BYTES = 128 * 10**9  # soft, decimal GB
