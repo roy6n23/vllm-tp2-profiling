@@ -24,6 +24,7 @@ import dataclasses
 import json
 import os
 import random
+import shutil
 from collections.abc import Callable, Iterable
 
 import numpy as np
@@ -152,6 +153,7 @@ def _write_outputs(spec: matrix.RunSpec, run_dir: str, engine: str, fi_backend: 
     elif kind == "smoke" and spec.p("gpu1_check"):
         write_points(os.path.join(run_dir, "points"), spec.config, spec.arm, "decode:b1", engine,
                      step_factor=GPU1_STEP_FACTOR)
+        shutil.copy(os.path.join(run_dir, "effective_config.json"), os.path.join(run_dir, "effective_config_gpu1.json"))
     elif kind == "offline":
         write_points(os.path.join(run_dir, "points"), spec.config, spec.arm, str(spec.p("points")), engine)
     elif kind == "bench_latency_xcheck":

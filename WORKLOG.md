@@ -109,7 +109,7 @@ merge; the fix rounds are in the git history.
 - [ ] Quick preflight on a real box: NV18, 700 W, fabric registered, `/dev/shm`; record the multicast attribute.
 - [ ] Which FlashInfer backend the TP2 baseline picks (`mnnvl` or `trtllm`), from the workspace log line. It decides whether A-FIB and the NVLS M3 variant run.
 - [ ] The effective-config log lines on the box match the patterns taken from source, per arm (backend list, `Enabled custom fusions: allreduce_rms`, the workspace line).
-- [ ] Real kernel names in the P0 traces vs the categorizer: `traces --check` must show an unclassified share < 1% and exact H6 counts. The name fixtures come from source, not from a real trace.
+- [ ] Real kernel names in the P0 traces vs the categorizer: `traces --check` must show an unclassified share < 1% and H6 (>= 99% of steps exact). The name fixtures come from source, not from a real trace.
 - [ ] Trace overhead ratio (traced vs untraced step time) with node-level graph tracing.
 - [ ] The model file gate passes on the real download.
 - [ ] TP1 decode batch 1 on GPU1 vs GPU0 (the DP2 derivation is flagged if they differ by ≥ 1%).

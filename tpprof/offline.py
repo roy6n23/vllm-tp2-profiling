@@ -234,6 +234,11 @@ class FakeEngine:
         self._steps: list[list[int]] = []
         self._window_batch = 0
         _check_spawn()
+        startup_log = os.environ.get("FAKE_ENGINE_LOG")
+        if startup_log:          # tests: the startup lines a real engine prints (contract C6), from a fixture
+            with open(startup_log) as f:
+                sys.stdout.write(f.read())
+            sys.stdout.flush()
         log.info("fake engine: tp=%d arm=%s ar_backend=%s cudagraph_mode=%s profile=%s", self.tp, self.arm,
                  self.ar_backend, self.cudagraph_mode, profile)
 

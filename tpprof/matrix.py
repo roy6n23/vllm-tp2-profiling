@@ -395,6 +395,13 @@ def _rate_run_s(config: str, rate: float, mu: float) -> float:
     return max(SWEEP_WINDOW_S, num_prompts_for(rate) / mu) + RUN_OVERHEAD_S + _warmups_s(config)
 
 
+def client_run_s(config: str, rate: float, num_prompts: int, mu_rps: Mapping[str, float] | None = None) -> float:
+    """The estimate of one client run of a serve session, the unit the session estimates add up: a saturation
+    run at rate inf, else a fixed-rate run (its prompt count follows from the rate)."""
+    mu = _mu(config, mu_rps)
+    return _sat_run_s(mu, num_prompts) if math.isinf(rate) else _rate_run_s(config, rate, mu)
+
+
 def _work_min(s: RunSpec, mu_rps: Mapping[str, float] | None) -> float:
     """Minutes of a spec excluding engine starts."""
     if s.kind in FIXED_MIN:

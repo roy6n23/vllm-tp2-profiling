@@ -515,3 +515,41 @@ def test_hypotheses_json_is_strict_json(records, tables):
         text = f.read()
     json.loads(text, parse_constant=lambda c: pytest.fail(f"non-finite constant {c} in hypotheses.json"))
     assert not any(isinstance(v, float) and math.isnan(v) for h in json.loads(text) for v in h.values())
+
+
+def test_points_count_only_from_an_engine_that_passed_the_check(tmp_path):
+    """Review C1: a real engine's points need a clean effective-config check on record (a failed check, or none
+    after a hard kill, keeps them out of every table); a failed check on the GPU1 smoke drops the GPU1 step."""
+    d = str(tmp_path / "results")
+    specs = make_records.build(d, tiers=("P0",), rounds=1, engine="vllm")
+
+    def edit_eff(spec, name, violations):
+        path = os.path.join(d, "raw", spec.run_id, name)
+        if violations is None:
+            os.remove(path)
+            return
+        with open(path) as f:
+            doc = json.load(f)
+        doc["violations"] = violations
+        with open(path, "w") as f:
+            json.dump(doc, f)
+
+    def offline(config, arm):
+        return next(s for s in specs if s.kind == "offline" and (s.config, s.arm) == (config, arm))
+
+    failed_check = offline("TP2", "base")
+    unchecked = offline("TP2", "AR3")
+    smoke = next(s for s in specs if s.kind == "smoke" and s.p("gpu1_check"))
+    edit_eff(failed_check, "effective_config.json", ['missing line "Using FlashAttention version 3" (found 2).'])
+    edit_eff(unchecked, "effective_config.json", None)
+    edit_eff(smoke, "effective_config_gpu1.json", ['unexpected line "Default vLLM sampling parameters"'])
+
+    tables = analyze.analyze(d)
+    used = {r["run_id"] for r in tables["offline_points"]}
+    assert failed_check.run_id not in used and unchecked.run_id not in used
+    assert offline("TP1", "base").run_id in used                  # a vetted run stays
+    gaps = {(g["run_id"], g["type"]) for g in tables["gaps"]}
+    for s in (failed_check, unchecked, smoke):
+        assert (s.run_id, "effective_config") in gaps
+    derived = [r for r in tables["offline_points"] if r["config"] == "DP2" and r["derived"]]
+    assert derived and all(r["gpu_asym"] is None for r in derived)   # no vetted GPU1 step to compare with

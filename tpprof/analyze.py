@@ -253,20 +253,41 @@ def _model_ms(pred: Mapping, row: Mapping) -> tuple[float | None, float | None, 
     return vals[0], min(v for v in vals if v is not None), max(v for v in vals if v is not None)
 
 
+def _engine_checked(run: Run, eff_name: str, rows: Sequence[Mapping], gaps: _Gaps, what: str) -> bool:
+    """Review C1: a real engine's numbers count only when its effective-config check is on record and clean.
+    The fake engine of a dry run prints no vLLM lines and is never checked."""
+    if rows and all(r.get("engine") == "fake" for r in rows):
+        return True
+    try:
+        doc = _read_json(os.path.join(run.path, eff_name))
+    except (OSError, ValueError):
+        doc = None
+    violations = doc.get("violations") if isinstance(doc, dict) else None
+    if violations is None:
+        gaps.add("effective_config", f"{what}: no engine check on record ({eff_name}); not used", run)
+        return False
+    if violations:
+        gaps.add("effective_config", f"{what}: the engine failed its check ({eff_name}: {violations[0]}); not used",
+                 run)
+        return False
+    return True
+
+
 def _smoke_gpu1_step(runs: Sequence[Run], gaps: _Gaps) -> float | None:
-    """AM14: the TP1 decode bs-1 step the smoke measured on GPU1."""
+    """AM14: the TP1 decode bs-1 step the smoke measured on GPU1 (points/, with effective_config_gpu1.json)."""
     steps = []
     for run in _of_kind(runs, "smoke"):
-        if run.config != "TP1":
+        d = os.path.join(run.path, "points")
+        if run.config != "TP1" or not os.path.isdir(d):
             continue
-        dirs = {os.path.dirname(p) for p in glob.glob(os.path.join(run.path, "**", "point-*.json"), recursive=True)}
-        for d in sorted(dirs):
-            try:
-                rows = results.offline_rows(d)
-            except _PARSE_ERRORS as e:
-                gaps.add("unreadable", f"smoke GPU1 points: {e}", run)
-                continue
-            steps += [r["step_s"] for r in rows if r["kind"] == "decode" and r["batch"] == 1 and r["step_s"]]
+        try:
+            rows = results.offline_rows(d)
+        except _PARSE_ERRORS as e:
+            gaps.add("unreadable", f"smoke GPU1 points: {e}", run)
+            continue
+        if not _engine_checked(run, "effective_config_gpu1.json", rows, gaps, "smoke GPU1 points"):
+            continue
+        steps += [r["step_s"] for r in rows if r["kind"] == "decode" and r["batch"] == 1 and r["step_s"]]
     return median_or_none(steps)
 
 
@@ -280,6 +301,9 @@ def _xcheck_rows(runs: Sequence[Run], lat: Mapping[tuple, list[float]], gaps: _G
         if not files:
             if run.status == "done":
                 gaps.add("unreadable", "no bench latency JSON in the run dir", run)
+            continue
+        if os.path.exists(os.path.join(run.path, "effective_config.json")) and not _engine_checked(
+                run, "effective_config.json", [], gaps, "bench latency"):
             continue
         try:
             res = results.load_latency_result(files[0])
@@ -312,6 +336,8 @@ def _offline(runs: Sequence[Run], pred: Mapping, gaps: _Gaps) -> tuple[list[dict
             continue
         if not got and run.status == "done":
             gaps.add("unreadable", "done, but no point files under points/", run)
+        if got and not _engine_checked(run, "effective_config.json", got, gaps, "offline points"):
+            continue
         for r in got:
             r.update(run_id=run.run_id, tier=run.tier, derived=False)
             if r["note"]:

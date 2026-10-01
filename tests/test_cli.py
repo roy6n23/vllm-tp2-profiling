@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from tests import synth_trace
 from tests.conftest import FAKE_BIN, ROOT
 from tests.test_runner import free_port_base, leftover_fakes
 from tpprof import cli, matrix, model
@@ -195,3 +196,51 @@ def test_cli_analyze_and_report_on_a_dry_run(tmp_path, capsys):
     summary = (res / "SUMMARY.md").read_text()
     assert summary.splitlines()[0].startswith("> FAKE DATA")
     assert leftover_fakes(res) == []
+
+
+def test_run_progress_reaches_a_pipe_line_by_line(tmp_path):
+    """Review I4: RUN_ON_GPU.md pipes `run` through tee; progress must not sit in an 8 KiB block buffer."""
+    res = tmp_path / "results"
+    smokes = [s for s in matrix.p0_specs() if s.kind == "smoke"]
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), env.get("PYTHONPATH")) if p)
+    proc = subprocess.Popen([PY, "-m", "tpprof", "run", "--tier", "P0", "--dry-run", "--only", "smoke",
+                             "--results-dir", str(res), "--port-base", str(free_port_base())],
+                            cwd=str(tmp_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        first = proc.stdout.readline()
+        last_done = os.path.exists(os.path.join(str(res), "raw", smokes[-1].run_id, "done.json"))
+    finally:
+        rest = proc.communicate(timeout=300)[0]
+    assert proc.returncode == 0, rest[-3000:]
+    assert first.strip() and not last_done, (first, rest[-2000:])
+    assert leftover_fakes(res) == []
+
+
+def _odd_step_trace(results_dir, spec, short_steps: list[int], steps: int = 200) -> None:
+    """A TP2 trace whose trace.sqlite has `short_steps` one all-reduce short, the summary matching it."""
+    ar = model.allreduces_per_step(2)
+    _trace_record(results_dir, spec, 0.001, ar)
+    d = results_dir / "raw" / spec.run_id
+    summ = json.loads((d / "trace_summary.json").read_text())
+    for rk in summ["ranks"]:
+        rk["steps"] = steps
+        rk["ar_ops_per_step"] = {"min": ar - 1 if short_steps else ar, "max": ar, "mode": ar}
+    (d / "trace_summary.json").write_text(json.dumps(summ))
+    ranks = [{"pid": 100 + r, "device": r, "tp": 2, "ar_backend": "trtllm", "batch": 1,
+              "steps": [[0, 0, 1, 1]] * steps, "drop_last": 0, "short_ar_steps": short_steps} for r in range(2)]
+    synth_trace.build_trace_db(str(d / "trace.sqlite"), ranks, measure=synth_trace.trace_span(ranks))
+
+
+def test_cli_traces_check_applies_the_h6_rule(tmp_path, capsys):
+    """Review M5: `traces --check` gates P1 on H6 as the spec states it (>= 99% of steps exact, counted from
+    trace.sqlite), not on every step: one odd step in 200 passes, three do not."""
+    tp2 = next(s for s in matrix.p0_specs() if s.kind == "trace" and s.config == "TP2")
+    _odd_step_trace(tmp_path, tp2, [7])
+    assert cli.main(["traces", "--check", "--results-dir", str(tmp_path)]) == 0, capsys.readouterr().out
+    assert "199/200" in capsys.readouterr().out
+
+    other = tmp_path / "other"
+    _odd_step_trace(other, tp2, [7, 70, 170])
+    assert cli.main(["traces", "--check", "--results-dir", str(other)]) == 1
+    assert "197/200" in capsys.readouterr().out

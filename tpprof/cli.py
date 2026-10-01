@@ -145,27 +145,50 @@ def _cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     return 1 if summary["failed"] else 0
 
 
-def _trace_lines(run_id: str, spec: dict, summ: dict) -> tuple[list[str], bool]:
-    from tpprof import model
+def _trace_lines(run_id: str, run_dir: str, spec: dict, summ: dict) -> tuple[list[str], bool]:
+    """One trace's gate, unclassified share per rank, and H6 as spec 4.8 states it: >= 99% of the rank-steps
+    have exactly the expected AR and AG op counts, counted from trace.sqlite (else the summary's lower bound),
+    so one odd step does not stop P1 (review M5)."""
+    import sqlite3
+
+    from tpprof import analyze, model
 
     tp = int((spec.get("engine") or {}).get("tp") or len(summ.get("ranks") or []) or 1)
     want_ar, want_ag = model.allreduces_per_step(tp), model.allgathers_per_step(tp)
     gate = summ.get("gate") or {}
-    ok = True
     lines = [f"{run_id}  {spec.get('config')}/{spec.get('arm')} {dict(spec.get('params') or []).get('points')}  "
              f"gate {'ok' if gate.get('ok') else 'FAILED: ' + '; '.join(map(str, gate.get('reasons', [])))}"]
-    for rk in summ.get("ranks") or []:
+    by_rank = None
+    sqlite_path = os.path.join(run_dir, "trace.sqlite")
+    if os.path.exists(sqlite_path):
+        try:
+            by_rank = analyze.sqlite_steps(sqlite_path, tp)
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as e:
+            lines.append(f"    trace.sqlite unreadable ({e}); H6 from the summary's lower bound")
+    shares_ok, exact_total, steps_total = True, 0, 0
+    for i, rk in enumerate(summ.get("ranks") or []):
         other = float((rk.get("category_frac") or {}).get("other", 0.0))
         ar, ag = rk.get("ar_ops_per_step") or {}, rk.get("ag_ops_per_step") or {}
-        h6 = all(d.get(k) == want for d, want in ((ar, want_ar), (ag, want_ag)) for k in ("min", "max", "mode"))
+        steps = by_rank[i] if by_rank is not None and i < len(by_rank) else None
+        if steps is not None:
+            exact, n, source = sum(s["exact_counts"] for s in steps), len(steps), "trace.sqlite"
+        else:
+            row = {"steps": rk.get("steps"), "tp": tp, "ar_min": ar.get("min"), "ar_max": ar.get("max"),
+                   "ar_mode": ar.get("mode"), "ag_min": ag.get("min"), "ag_max": ag.get("max"),
+                   "ag_mode": ag.get("mode")}
+            exact, n, source = analyze.h6_bounds(row, None)["h6_exact_min"], int(rk.get("steps") or 0), "summary"
+        exact_total, steps_total = exact_total + exact, steps_total + n
         bad_share = other >= TRACE_UNCLASSIFIED_MAX
-        ok &= h6 and not bad_share
+        shares_ok &= not bad_share
         top = ", ".join(f"{name} {frac:.2%}" for name, frac in (rk.get("unclassified_top") or [])[:3])
         lines.append(f"    rank {rk.get('rank')}: unclassified {other:.2%}{' (>= 1%)' if bad_share else ''}"
-                     f"{' [' + top + ']' if bad_share and top else ''}; "
-                     f"H6 {'ok' if h6 else 'off'}: AR/step {ar.get('min')}..{ar.get('max')} (want {want_ar}), "
+                     f"{' [' + top + ']' if bad_share and top else ''}; exact {exact}/{n} steps ({source}); "
+                     f"AR/step {ar.get('min')}..{ar.get('max')} (want {want_ar}), "
                      f"AG/step {ag.get('min')}..{ag.get('max')} (want {want_ag})")
-    return lines, ok
+    frac = exact_total / steps_total if steps_total else 0.0
+    h6 = frac >= analyze.H6_MIN_EXACT
+    lines.append(f"    H6 {'ok' if h6 else 'off'}: {frac:.2%} of rank-steps exact (want >= {analyze.H6_MIN_EXACT:.0%})")
+    return lines, h6 and shares_ok
 
 
 def _cmd_traces(args: argparse.Namespace) -> int:
@@ -180,7 +203,7 @@ def _cmd_traces(args: argparse.Namespace) -> int:
         if spec.get("kind") != "trace":
             continue
         found += 1
-        lines, ok = _trace_lines(name, spec, _read_json(summ_path))
+        lines, ok = _trace_lines(name, d, spec, _read_json(summ_path))
         all_ok &= ok
         print("\n".join(lines))
     if not found:
@@ -275,6 +298,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(line_buffering=True)       # progress through `| tee` shows as it happens (review I4)
     parser = build_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     return args.func(args)

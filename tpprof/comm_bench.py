@@ -40,6 +40,11 @@ SYN_ALPHA_S, SYN_BETA_BPS, SYN_NOISE = 6e-6, 2.6e11, 0.02
 _TUNING = re.compile(r"NCCL INFO (?P<func>\w+): (?P<bytes>\d+) Bytes -> Algo (?P<algo>\w+) proto (?P<proto>\w+) "
                      r"channel\{Lo\.\.Hi\}=\{\d+\.\.\d+\}")
 _NVLS = re.compile(r"NVLS multicast support is (?P<not>not )?available on dev \d+")
+# A forced algorithm/protocol NCCL cannot run is a hard error since 2.24 (D7-2); a failed NVLS multicast
+# bind fails communicator init in 2.29+ (D7-3, src/transport/nvls.cc:287). Spec 4.6: the first is recorded as
+# unsupported, the second retried with NCCL_NVLS_ENABLE=0.
+NCCL_UNSUPPORTED = "no algorithm/protocol available"
+NVLS_BIND_FAILED = "Failed to bind NVLink SHARP (NVLS) Multicast memory"
 _VERSION = re.compile(r"(?:^|NCCL INFO )NCCL version (?P<v>\d+\.\d+\.\d+)(?:\+cuda[\d.]+)?", re.MULTILINE)
 
 
@@ -75,9 +80,10 @@ def variant_env(algo: str | None, proto: str | None, *, debug_dir: str | None = 
     return env
 
 
-def torchrun_argv(out_jsonl: str, modes: str, variant: tuple, torchrun: str = "torchrun") -> list[str]:
+def torchrun_argv(out_jsonl: str, modes: str, variant: tuple, torchrun: str = "torchrun", *, iters: int = ITERS,
+                  warmup: int = WARMUP) -> list[str]:
     return [torchrun, "--nproc-per-node", "2", "-m", "tpprof.comm_bench", "--out", out_jsonl, "--mode", modes,
-            "--iters", str(ITERS), "--warmup", str(WARMUP), "--graph-ops", str(GRAPH_OPS),
+            "--iters", str(iters), "--warmup", str(warmup), "--graph-ops", str(GRAPH_OPS),
             "--variant", variant_label(variant)]
 
 
@@ -148,10 +154,11 @@ def _synthetic_nccl_debug(variant: tuple, modes: list[str]) -> None:
     lines.append(f"NVLS multicast support is {'' if nvls else 'not '}available on dev 0 "
                  f"(NVLS_NCHANNELS {16 if nvls else 0})")
     algo, proto = variant
+    shown_algo = os.environ.get("FAKE_NCCL_TUNING_ALGO") or (algo or "ring").upper()   # tests: NCCL ignored it
     for _ in modes:
         for size in SIZES:
             p = proto or ("LL" if size <= 64 * 1024 else "Simple")
-            lines.append(f"AllReduce: {size} Bytes -> Algo {(algo or 'ring').upper()} proto {p.upper()} "
+            lines.append(f"AllReduce: {size} Bytes -> Algo {shown_algo} proto {p.upper()} "
                          f"channel{{Lo..Hi}}={{0..1}}")
     with open(path, "a") as f:
         f.write("".join(pre + ln + "\n" for ln in lines))
@@ -160,6 +167,14 @@ def _synthetic_nccl_debug(variant: tuple, modes: list[str]) -> None:
 def _synthetic(args, variant: tuple, modes: list[str], rank: int, world_size: int) -> int:
     if rank != 0:
         return 0
+    # tests: the two NCCL init/launch failures spec 4.6 handles (FAKE_NCCL_NVLS_BIND_FAIL, FAKE_NCCL_UNSUPPORTED)
+    if os.environ.get("FAKE_NCCL_NVLS_BIND_FAIL") == "1" and os.environ.get("NCCL_NVLS_ENABLE") != "0":
+        print(f"NCCL WARN Cuda failure 1 'invalid argument'\nNCCL WARN {NVLS_BIND_FAILED}", file=sys.stderr)
+        return 1
+    if args.variant in os.environ.get("FAKE_NCCL_UNSUPPORTED", "").split(","):
+        print(f"torch.distributed.DistBackendError: NCCL error: invalid usage (run with NCCL_DEBUG=WARN for "
+              f"details), NCCL version {NCCL_EXPECTED}\nLast error:\n{NCCL_UNSUPPORTED}", file=sys.stderr)
+        return 1
     _synthetic_nccl_debug(variant, modes)
     rows = []
     for mode in modes:
