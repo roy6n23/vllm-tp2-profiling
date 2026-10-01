@@ -76,6 +76,7 @@ START_SKEW_FLAG_S = 1.0             # spec 4.4: DP2-rand start skew above 1 s is
 # the preflight has its own gpu_idle gate with the fix text.
 NO_GPU_KINDS = frozenset({"preflight", "envcapture", "tokbench"})
 START_FAILURES = ("server_start_failed", "effective_config")
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # Decode traces: one iteration of PROFILE_DECODE_OUTPUT_LEN tokens; prefill traces: 5 iterations (spec 4.5).
 TRACE_WINDOW = {"decode": (DECODE_WARMUP, 1, 200), "prefill": (PREFILL_WARMUP, 5, 5)}   # warmup, iters, min_steps
 
@@ -177,6 +178,14 @@ def _rate_label(rate: float) -> str:
     return "inf" if math.isinf(rate) else repr(float(rate))
 
 
+def _read_text(path: str) -> str:
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def _truncate(text: str, limit: int = TRACEBACK_CHARS) -> str:
     """Head and tail of a long detail: the head says what failed, the tail holds the traceback or log end."""
     if len(text) <= limit:
@@ -239,16 +248,31 @@ def _wait_for_line(path: str, line: str, timeout_s: float) -> None:
         time.sleep(0.1)
 
 
+def _kept_across_attempts(name: str) -> bool:
+    """What a retry resumes from: the spec, the previous failure, the offline points (AM13) with the engine
+    checks that vouch for them (effective_config*.json, review C1), and points already rejected."""
+    return (name in ("spec.json", "failed.prev.json", "points", "prev-attempt") or name.startswith("rejected-points-")
+            or (name.startswith("effective_config") and name.endswith(".json")))
+
+
 def _set_aside_attempt(run_dir: str) -> None:
-    """Before a retry: the failed attempt's logs and client runs go to prev-attempt/, so logparse reads only
-    the new attempt's engine logs and a session's sub-runs start afresh. Offline points stay (AM13 resume)."""
+    """Before a retry, or a rerun of a run a killed invocation left incomplete: everything else of the previous
+    attempt goes to prev-attempt/, so logparse reads only the new attempt's engine logs (logs are appended to),
+    sub-runs and monitors start afresh, and cmd.json lists only the new attempt's commands (review I1, M2)."""
     prev = os.path.join(run_dir, "prev-attempt")
     shutil.rmtree(prev, ignore_errors=True)
-    stale = glob.glob(os.path.join(run_dir, "*.log")) + glob.glob(os.path.join(run_dir, "sub-*"))
+    stale = [n for n in os.listdir(run_dir) if not _kept_across_attempts(n)]
     if stale:
         os.makedirs(prev)
-        for path in stale:
-            os.replace(path, os.path.join(prev, os.path.basename(path)))
+        for name in stale:
+            os.replace(os.path.join(run_dir, name), os.path.join(prev, name))
+
+
+def _incomplete(run_dir: str) -> bool:
+    """A run a killed invocation left behind: started (spec.json), but neither done.json nor failed.json."""
+    started, done, failed = (os.path.exists(os.path.join(run_dir, name))
+                             for name in ("spec.json", "done.json", "failed.json"))
+    return started and not done and not failed
 
 
 @dataclass
@@ -278,6 +302,8 @@ class Runner:
         self._started_configs: set[str] = set()
         self._dead: dict[tuple[str, str], str] = {}       # (tier, config) -> run_id of the session that failed to start
         self._preflight_stop: str | None = None                  # set by a failed preflight: skip everything after it
+        self._busy_stop: str | None = None                       # set by a busy GPU pre-check: skip GPU runs after it
+        self._stop_signal = "SIGINT"
 
     # ------------------------------------------------------------ tiers
 
@@ -302,6 +328,8 @@ class Runner:
         previous = self._install_sigint()
         t_wall, t_mono = time.time(), time.monotonic()
         self._preflight_stop = None
+        self._busy_stop = None
+        self._sweep_orphans()
         try:
             for tier in wanted:
                 for phase in self._phases(tier):
@@ -338,10 +366,27 @@ class Runner:
     def _run_or_skip(self, spec: RunSpec) -> tuple[str, str | None]:
         if self._preflight_stop is not None:
             return "skipped", self._preflight_stop
+        if self._busy_stop is not None and spec.kind not in NO_GPU_KINDS:
+            return "skipped", self._busy_stop
         status = self.run_spec(spec)
         if spec.kind == "preflight" and os.path.exists(os.path.join(self.raw, spec.run_id, "failed.json")):
             self._preflight_stop = f"preflight_failed:{spec.run_id}"
+        if status == "failed" and self.last_reason == "gpus_busy":
+            # the GPUs are held by something this invocation cannot free: stop, rather than wait before each run
+            self._busy_stop = f"gpus_busy:{spec.run_id}"
         return status, self.last_reason
+
+    def _sweep_orphans(self) -> None:
+        """Kill what a killed invocation left running: processes tagged with a run it left incomplete (review I1)."""
+        if not os.path.isdir(self.raw):
+            return
+        for name in sorted(os.listdir(self.raw)):
+            d = os.path.join(self.raw, name)
+            if not name.startswith("_") and os.path.isdir(d) and _incomplete(d):
+                for tag in (name, f"{name}{MONITOR_TAG_SUFFIX}"):
+                    killed = procs.sweep_tagged(tag)
+                    if killed:
+                        self.ctx.log(f"killed leftover processes {killed} of an earlier invocation, tagged {tag}")
 
     def _phases(self, tier: str) -> list[Callable[[], tuple[list[RunSpec], list[tuple[str, str, str]]]]]:
         """Each phase returns (specs, [(placeholder id, kind, skip reason)]) when it is reached, so the P1
@@ -372,7 +417,9 @@ class Runner:
 
     # ------------------------------------------------------------ SIGINT
 
-    def _install_sigint(self) -> object:
+    def _install_sigint(self) -> dict | None:
+        """Ctrl-C, SIGTERM (a kill) and SIGHUP (a closed tmux window) all stop the current run cleanly: its
+        processes are stopped, it is marked failed(interrupted), and a rerun resumes (review I1)."""
         if threading.current_thread() is not threading.main_thread():
             return None
 
@@ -381,13 +428,14 @@ class Runner:
                 self.ctx.log("already stopping; waiting for the current run's processes to exit")
                 return
             self._stop_requested = True
+            self._stop_signal = signal.Signals(signum).name
             raise KeyboardInterrupt
 
-        return signal.signal(signal.SIGINT, handler)
+        return {sig: signal.signal(sig, handler) for sig in STOP_SIGNALS}
 
-    def _restore_sigint(self, previous: object) -> None:
-        if previous is not None:
-            signal.signal(signal.SIGINT, previous)
+    def _restore_sigint(self, previous: dict | None) -> None:
+        for sig, handler in (previous or {}).items():
+            signal.signal(sig, handler)
 
     # ------------------------------------------------------------ one spec
 
@@ -410,12 +458,18 @@ class Runner:
                 prev_reason = str(prev.get("reason"))
             except (OSError, ValueError, AttributeError):
                 prev_reason = "unreadable failed.json"
-            if not (self.retry_failed or prev_reason == "interrupted"):
+            # A failed preflight always reruns: it takes a minute, and the rerun may carry the gate options
+            # (--accept-topology, --skip-gate) that RUN_ON_GPU.md prescribes for it (review I3).
+            if not (self.retry_failed or prev_reason == "interrupted" or spec.kind == "preflight"):
                 if spec.kind == "serve_session" and prev_reason in START_FAILURES:
                     self._dead[(spec.tier, spec.config)] = spec.run_id     # its dependents stay skipped too
                 self.last_reason = f"previously_failed:{prev_reason}"
                 return "skipped"
             os.replace(failed_path, os.path.join(run_dir, "failed.prev.json"))
+            _set_aside_attempt(run_dir)
+        elif os.path.isdir(run_dir) and _incomplete(run_dir):
+            self._sweep(spec)
+            self.ctx.log(f"       {spec.run_id} was left incomplete by an earlier invocation; rerunning it")
             _set_aside_attempt(run_dir)
         if spec.kind == "serve_session" and (spec.tier, spec.config) in self._dead:
             self.last_reason = f"dependency_failed:{self._dead[(spec.tier, spec.config)]}"
@@ -439,7 +493,7 @@ class Runner:
         except KeyboardInterrupt:
             self.interrupted = True
             self._sweep(spec)
-            self._fail(spec, run_dir, "interrupted", "stopped by Ctrl-C (SIGINT)")
+            self._fail(spec, run_dir, "interrupted", f"stopped by {self._stop_signal}")
             return "failed"
         except RunFailure as e:
             if spec.kind == "serve_session" and e.reason in START_FAILURES:
@@ -569,12 +623,19 @@ class Runner:
     # ------------------------------------------------------------ effective config
 
     def _check_engine_logs(self, spec: RunSpec, run_dir: str, logs: Sequence[tuple[str, str]], serve: bool,
-                           out_name: str = "effective_config.json") -> list[str]:
-        """logparse every engine log against its expectation; writes effective_config.json and returns violations."""
+                           out_name: str = "effective_config.json", upto: Mapping[str, int] | None = None
+                           ) -> list[str]:
+        """logparse every engine log against its expectation; writes effective_config.json and returns violations.
+
+        upto maps a log path to the byte size to read up to: a server's log as it was before the runner stopped
+        it, so lines the stop itself provokes are not charged to the run (review I5)."""
         texts, violations = [], []
         for name, path in logs:
-            with open(path, errors="replace") as f:
-                text = f.read()
+            with open(path, "rb") as f:
+                data = f.read()
+            if upto is not None and path in upto:
+                data = data[:upto[path]]
+            text = data.decode(errors="replace")
             texts.append(text)
             v = logparse.check(logparse.parse_engine_log(text), logparse.expectation_for(name, spec.arm, serve))
             violations += [f"{name}: {x}" for x in v] if len(logs) > 1 else v
@@ -624,22 +685,79 @@ class Runner:
         return {**self.env, "CUDA_VISIBLE_DEVICES": ",".join(map(str, ALL_GPUS))}
 
     def _comm(self, spec: RunSpec, run_dir: str) -> None:
+        if spec.kind == "comm_m3":
+            self._comm_m3(spec, run_dir)
+            return
         env = self._comm_env()
         if spec.kind == "comm_m1":
             out = os.path.join(run_dir, "m1.json")
             argv, parse = vendored.m1_argv(out, self.ctx.torchrun), vendored.parse_m1
-        elif spec.kind == "comm_m2":
+        else:
             out = os.path.join(run_dir, "m2.jsonl")
             argv, parse = vendored.m2_argv(out, self.ctx.torchrun), vendored.parse_m2
-        else:
-            out = os.path.join(run_dir, "m3.jsonl")
-            variant = comm_bench.parse_variant(str(spec.p("variant")))
-            env.update(comm_bench.variant_env(*variant))          # the label and the env of the same variant
-            argv = comm_bench.torchrun_argv(out, str(spec.p("modes")), variant, self.ctx.torchrun)
-            parse = comm_bench.load_rows
         with self._monitors(spec, run_dir):
             self._run_cmd(spec, run_dir, argv, env, f"{spec.kind}.log", self._timeout(spec, False))
         self._write_rows(run_dir, parse(out))
+
+    def _comm_m3(self, spec: RunSpec, run_dir: str) -> None:
+        """M3 and its NCCL verification (spec 4.6, review I6): the timed sweep, then a short diagnostic run of
+        the same variant under NCCL_DEBUG=INFO, whose TUNING lines must show the forced algorithm and protocol;
+        the rows are written only then. A variant NCCL rejects is recorded as unsupported, and an NVLS bind
+        failure at init is retried once with NCCL_NVLS_ENABLE=0 (nvls itself cannot be: it is unsupported)."""
+        variant = comm_bench.parse_variant(str(spec.p("variant")))
+        algo, proto = variant
+        label = comm_bench.variant_label(variant)
+        env = {**self._comm_env(), **comm_bench.variant_env(*variant)}   # the label and the env of one variant
+        out = os.path.join(run_dir, "m3.jsonl")
+        argv = comm_bench.torchrun_argv(out, str(spec.p("modes")), variant, self.ctx.torchrun)
+        verify_path = os.path.join(run_dir, "nccl_verify.json")
+        record: dict = {"variant": label, "requested": {"algo": algo, "proto": proto}, "unsupported": False,
+                        "nvls_disabled_retry": False}
+        timeout = self._timeout(spec, False)
+        debug_dir = os.path.join(run_dir, "nccl-debug")
+        with self._monitors(spec, run_dir):
+            try:
+                self._run_cmd(spec, run_dir, argv, env, "comm_m3.log", timeout)
+            except RunFailure:
+                text = _read_text(os.path.join(run_dir, "comm_m3.log"))
+                nvls_failed = comm_bench.NVLS_BIND_FAILED in text
+                if comm_bench.NCCL_UNSUPPORTED in text or (nvls_failed and algo == "nvls"):
+                    record["unsupported"] = True
+                    _write_json(verify_path, record)
+                    why = comm_bench.NVLS_BIND_FAILED if nvls_failed else comm_bench.NCCL_UNSUPPORTED
+                    raise RunFailure("nccl_unsupported", f'{label}: NCCL reports "{why}"; recorded as unsupported '
+                                                         "(spec 4.6)") from None
+                if not nvls_failed:
+                    raise
+                self.ctx.log(f"       {label}: NVLS multicast memory could not be bound; rerun with NCCL_NVLS_ENABLE=0")
+                env["NCCL_NVLS_ENABLE"] = "0"
+                record["nvls_disabled_retry"] = True
+                self._run_cmd(spec, run_dir, argv, env, "comm_m3-nvls-off.log", timeout)
+            os.makedirs(debug_dir, exist_ok=True)
+            diag_argv = comm_bench.torchrun_argv(os.path.join(run_dir, "m3-diagnostic.jsonl"), "eager", variant,
+                                                 self.ctx.torchrun, iters=1, warmup=1)
+            self._run_cmd(spec, run_dir, diag_argv, {**env, **comm_bench.variant_env(*variant, debug_dir=debug_dir)},
+                          "comm_m3-diagnostic.log", timeout)
+        text = "".join(_read_text(p) for p in sorted(glob.glob(os.path.join(debug_dir, "*"))))
+        tuning = [t for t in comm_bench.parse_tuning_lines(text) if t["func"] == "AllReduce"]
+        algos, protos = sorted({t["algo"].upper() for t in tuning}), sorted({t["proto"].upper() for t in tuning})
+        mismatch = []
+        if algo is not None and algos != [algo.upper()]:
+            mismatch.append(f"algorithms {algos} where {algo.upper()} was forced")
+        if proto is not None and protos != [proto.upper()]:
+            mismatch.append(f"protocols {protos} where {proto.upper()} was forced")
+        forced = algo is not None or proto is not None
+        record.update(observed={"algos": algos, "protos": protos}, tuning_lines=len(tuning),
+                      nccl_version=comm_bench.parse_nccl_version(text),
+                      nvls_support=comm_bench.parse_nvls_support(text),
+                      verified=(not mismatch) if tuning or not forced else None)
+        _write_json(verify_path, record)
+        if mismatch:
+            raise RunFailure("nccl_variant_mismatch", f"{label}: NCCL's TUNING lines show {'; '.join(mismatch)}, so "
+                                                      "the rows would carry the wrong label; none written")
+        if record["verified"] is None:
+            self.ctx.log(f"       warning: {label}: NCCL logged no AllReduce TUNING lines; the variant is unverified")
+        self._write_rows(run_dir, comm_bench.load_rows(out))
 
     def _nccl_tests_bin(self) -> str:
         return os.path.join(NCCL_TESTS_BIN_DIR, "all_reduce_perf")
@@ -680,16 +798,92 @@ class Runner:
 
     def _offline(self, spec: RunSpec, run_dir: str) -> None:
         [cfg] = self._engine_configs(spec)
-        argv = self._offline_argv(cfg, run_dir, ["--points", str(spec.p("points"))])
         with self._monitors(spec, run_dir):
-            self._run_cmd(spec, run_dir, argv, cfg.environment(self.env), "offline.log", self._timeout(spec, True))
-        self._check_offline_log(spec, run_dir, os.path.join(run_dir, "offline.log"))
-        from tpprof.offline import parse_points
+            self._offline_points(spec, run_dir, cfg, str(spec.p("points")), cfg.environment(self.env), "offline.log",
+                                 "effective_config.json")
 
-        missing = [p.filename() for p in parse_points(str(spec.p("points")))
-                   if not os.path.exists(os.path.join(run_dir, "points", p.filename()))]
+    def _offline_points(self, spec: RunSpec, run_dir: str, cfg: engine.EngineConfig, points_spec: str,
+                        env: Mapping[str, str], log_name: str, eff_name: str,
+                        meta: Mapping[str, object] | None = None) -> None:
+        """The offline driver for points_spec into run_dir/points, keeping only points whose engine passed the
+        effective-config check (review C1).
+
+        The driver resumes per point (AM13) and starts no engine when every point exists, so the check is tied
+        to the attempt that wrote the points: each attempt's engine log is checked, also when the driver fails,
+        and a violation moves points/ aside. A retry whose points all exist, with a clean check on record, does
+        not start the driver again."""
+        from tpprof.offline import parse_points, pending_points
+
+        points_dir = os.path.join(run_dir, "points")
+        points = parse_points(points_spec)
+        if not self.ctx.dry_run and os.path.isdir(points_dir) and os.listdir(points_dir):
+            eff = self._effective_config(run_dir, eff_name)
+            if eff is None or eff.get("violations"):
+                self._quarantine_points(run_dir, f"no clean engine check on record ({eff_name})")
+            elif not pending_points(points, points_dir, warn=False):
+                self.ctx.log(f"       every point exists and its engine passed the check ({eff_name}); not rerun")
+                return
+        argv = self._offline_argv(cfg, run_dir, ["--points", points_spec], meta)
+        log_path = os.path.join(run_dir, log_name)
+        try:
+            self._run_cmd(spec, run_dir, argv, env, log_name, self._timeout(spec, True))
+        except RunFailure as e:
+            violations = self._vet_engine_log(spec, run_dir, log_path, eff_name)
+            if violations:
+                raise RunFailure("effective_config", "; ".join(violations) + f"\n(the driver also failed: "
+                                                                             f"{e.reason}: {e.detail})") from None
+            raise
+        except BaseException:
+            self._vet_engine_log(spec, run_dir, log_path, eff_name)
+            raise
+        violations = self._vet_engine_log(spec, run_dir, log_path, eff_name)
+        if violations:
+            raise RunFailure("effective_config", "; ".join(violations))
+        if violations is None:                         # exited 0 without starting an engine
+            eff = self._effective_config(run_dir, eff_name)
+            if eff is None or eff.get("violations"):
+                self._quarantine_points(run_dir, f"{log_name}: the driver started no engine")
+                raise RunFailure("effective_config", f"{log_name}: the driver started no engine and no clean "
+                                                     f"engine check is on record ({eff_name}); points set aside")
+        missing = [p.filename() for p in points if not os.path.exists(os.path.join(points_dir, p.filename()))]
         if missing:
             raise RunFailure("missing_points", f"the driver exited 0 but wrote no {', '.join(missing)}")
+
+    def _vet_engine_log(self, spec: RunSpec, run_dir: str, log_path: str, eff_name: str) -> list[str] | None:
+        """Check an offline driver attempt's engine log (serve=False) into eff_name: its violations, or None
+        when no engine started in it. Violations move points/ aside (review C1). The dry run's fake engine
+        prints no vLLM lines, so the dry run checks nothing."""
+        if self.ctx.dry_run:
+            return []
+        try:
+            with open(log_path, errors="replace") as f:
+                if logparse.parse_engine_log(f.read()).vllm_version is None:
+                    return None
+        except OSError:
+            return None
+        violations = self._check_engine_logs(spec, run_dir, [(spec.config, log_path)], serve=False,
+                                             out_name=eff_name)
+        if violations:
+            self._quarantine_points(run_dir, f"{eff_name}: {violations[0]}")
+        return violations
+
+    def _effective_config(self, run_dir: str, eff_name: str) -> dict | None:
+        try:
+            doc = _read_json(os.path.join(run_dir, eff_name))
+        except (OSError, ValueError):
+            return None
+        return doc if isinstance(doc, dict) else None
+
+    def _quarantine_points(self, run_dir: str, why: str) -> None:
+        """Move points/ to rejected-points-<n>/: kept for inspection, never read as data."""
+        src = os.path.join(run_dir, "points")
+        if not os.path.isdir(src) or not os.listdir(src):
+            return
+        n = 1
+        while os.path.exists(os.path.join(run_dir, f"rejected-points-{n}")):
+            n += 1
+        os.replace(src, os.path.join(run_dir, f"rejected-points-{n}"))
+        self.ctx.log(f"       points set aside as rejected-points-{n}: {why}")
 
     def _xcheck(self, spec: RunSpec, run_dir: str) -> None:
         [cfg] = self._engine_configs(spec)
@@ -793,8 +987,9 @@ class Runner:
     def _server_logs(self, handles: Sequence[server.ServerHandle]) -> list[tuple[str, str]]:
         return [(h.cfg.name, h.log_path) for h in handles]
 
-    def _check_server_logs(self, spec: RunSpec, run_dir: str, handles: Sequence[server.ServerHandle]) -> None:
-        v = self._check_engine_logs(spec, run_dir, self._server_logs(handles), serve=True)
+    def _check_server_logs(self, spec: RunSpec, run_dir: str, handles: Sequence[server.ServerHandle],
+                           upto: Mapping[str, int] | None = None) -> None:
+        v = self._check_engine_logs(spec, run_dir, self._server_logs(handles), serve=True, upto=upto)
         if v:
             raise RunFailure("effective_config", "; ".join(v))
 
@@ -826,17 +1021,16 @@ class Runner:
                                                  self._timeout(spec, False))
                 self._dead_server(handles)
             finally:
+                before_stop = {h.log_path: _file_size(h.log_path) for h in handles}
                 self._stop_servers(run_dir, handles)
-            self._check_server_logs(spec, run_dir, handles)
+            self._check_server_logs(spec, run_dir, handles, before_stop)
             if violations:
                 raise RunFailure("invalid_smoke", "; ".join(violations))
             if spec.p("gpu1_check"):
                 # AM14: the same TP1 decode bs-1 point on GPU1, to compare with GPU0 (DP2's second rank)
                 env = {**cfg.environment(self.env), "CUDA_VISIBLE_DEVICES": "1"}
-                argv = self._offline_argv(cfg, run_dir, ["--points", "decode:b1"], {"gpu": 1})
-                self._run_cmd(spec, run_dir, argv, env, "offline-gpu1.log", self._timeout(spec, True))
-                self._check_offline_log(spec, run_dir, os.path.join(run_dir, "offline-gpu1.log"),
-                                        "effective_config_gpu1.json")
+                self._offline_points(spec, run_dir, cfg, "decode:b1", env, "offline-gpu1.log",
+                                     "effective_config_gpu1.json", {"gpu": 1})
 
     # ------------------------------------------------------------ serve sessions
 
@@ -864,22 +1058,37 @@ class Runner:
 
     def _serve_session(self, spec: RunSpec, run_dir: str) -> None:
         handles: list[server.ServerHandle] = []
-        timeout = self._timeout(spec, False)
+        valid = 0
         with self._monitors(spec, run_dir):
             try:
                 handles = self._start_servers(spec, run_dir)
                 for h in handles:
                     _wait_for_line(h.log_path, logparse.STARTUP_COMPLETE, STARTUP_LINE_WAIT_S)
                 self._check_server_logs(spec, run_dir, handles)
+                deadline = time.monotonic() + self._timeout(spec, False)       # spec 7.4: 3x the estimate
                 for k, sub in enumerate(self._sub_runs(spec)):
                     sub_dir = os.path.join(run_dir, f"sub-{k}")
                     os.makedirs(sub_dir, exist_ok=True)
                     names = ["result.json"] if len(handles) == 1 else [f"result-{i}.json" for i in range(len(handles))]
-                    self._client_run(spec, run_dir, sub_dir, handles, sub, k, names, timeout)
+                    violations, _ = self._client_run(spec, run_dir, sub_dir, handles, sub, k, names,
+                                                     self._client_timeout(spec, sub, k, deadline))
+                    valid += not violations
                     self._dead_server(handles)
             finally:
+                before_stop = {h.log_path: _file_size(h.log_path) for h in handles}
                 self._stop_servers(run_dir, handles)
-        self._check_server_logs(spec, run_dir, handles)
+        self._check_server_logs(spec, run_dir, handles, before_stop)
+        if spec.p("phase") == "sat" and not valid:
+            raise RunFailure("no_valid_saturation_run", "no saturation client run was valid, so the rate grid "
+                                                        "(AM6) cannot use this session; see sub-*/validation.json")
+
+    def _client_timeout(self, spec: RunSpec, sub: _SubRun, k: int, deadline: float) -> float:
+        """3x the client run's own estimate (spec 7.4), within what is left of the session's 3x (review I2)."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise RunFailure("timeout", f"the session passed 3x its estimate before sub-{k}")
+        own = TIMEOUT_FACTOR * matrix.client_run_s(spec.config, sub.rate, sub.num_prompts, self._mu_rps())
+        return min(max(MIN_TIMEOUT_S, own), left)
 
     def _client_specs(self, spec: RunSpec, handles: Sequence[server.ServerHandle], sub: _SubRun, k: int,
                       result_dir: str, names: Sequence[str]) -> list[client.ClientSpec]:
@@ -927,6 +1136,11 @@ class Runner:
                 "t_wall_start": o.t_wall_start, "t_mono_start": o.t_mono_start, "t_wall_end": o.t_wall_end,
                 "t_mono_end": o.t_mono_end, "exit_code": o.exit_code, "timed_out": o.timed_out,
                 "log": os.path.relpath(o.log_path, run_dir)})
+        late = [os.path.relpath(o.log_path, run_dir) for o in outcomes if o.timed_out]
+        if late:
+            self._dead_server(handles)                  # a dead server is the better reason
+            raise RunFailure("client_timeout", f"sub-{k}: the client was still running after {timeout_s:.0f} s "
+                                               f"(3x its estimate) with the server up; see {', '.join(late)}")
         after_text = self._scrape_or_none(handles)
         if after_text is not None:
             with open(os.path.join(sub_dir, "metrics_after.prom"), "w") as f:
@@ -935,9 +1149,7 @@ class Runner:
         violations: list[str] = []
         flags: list[str] = []
         for o in outcomes:
-            if o.timed_out:
-                violations.append(f"client {os.path.basename(o.log_path)} timed out after {timeout_s:.0f} s")
-            elif o.exit_code != 0:
+            if o.exit_code != 0:
                 violations.append(f"client exited {o.exit_code}; see {os.path.basename(o.log_path)}")
         merged = None
         try:

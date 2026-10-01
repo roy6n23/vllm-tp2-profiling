@@ -113,4 +113,4 @@ python -m tpprof preflight
 
 step "9/9 done"
 echo "next: source $ENV_FILE && cd $REPO && python -m tpprof matrix --estimate"
-echo "then: python -m tpprof run --tier P0 2>&1 | tee results/p0.log"
+echo "then: python -m tpprof run --tier P0 2>&1 | tee -ai results/p0.log"

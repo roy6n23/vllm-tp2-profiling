@@ -187,6 +187,8 @@ def _layout(w: _Writer, ri: int, rank: dict, collide: bool) -> tuple[int, int]:
     # the input copy and its gap fit before GRAPH_LAUNCH_NS; PDL overlap only shortens the step
     period = GRAPH_LAUNCH_NS + work + sync + IDLE_GAP_NS
     n_keep = len(rank["steps"]) - rank.get("drop_last", 0)
+    short = set(rank.get("short_ar_steps", ()))              # steps missing their first (embedding) all-reduce op
+    n_first_ar = len(_ar_op(tp, rank["ar_backend"], rank["batch"]))
     cid = 0 if collide else ri * 1_000_000
     cpu = T0_NS + ri * RANK_SKEW_NS
     gpu = 0
@@ -208,6 +210,8 @@ def _layout(w: _Writer, ri: int, rank: dict, collide: bool) -> tuple[int, int]:
         gpu = max(gpu, start + dur)
 
     for k, (nc, nct, ng, ngt) in enumerate(rank["steps"][:n_keep]):
+        step_ks = ks[n_first_ar:] if k in short else ks
+        step_split = split - n_first_ar if k in short else split
         lag = _lag(k, period)
         w.add("NVTX_EVENTS", (cpu, cpu + RANGE_NS, 59, None, None, None,
                               f"execute_context_{nc}({nct})_generation_{ng}({ngt})", gtid, None, None, 0))
@@ -221,14 +225,14 @@ def _layout(w: _Writer, ri: int, rank: dict, collide: bool) -> tuple[int, int]:
         t = cpu + GRAPH_LAUNCH_NS
         c = launch("cudaGraphLaunch_v10000", t, 8_000)
         op = 0
-        for node, (name, dur) in enumerate(ks[:split], start=1):
+        for node, (name, dur) in enumerate(step_ks[:step_split], start=1):
             if name in _PDL or name in (CUSTOM_AR, NCCL_AR):
                 if tp > 1 and op % tp == ri % tp:
                     dur += SYNC_WAIT_NS
                 op += 1
             kernel(name, dur, t + lag, c, node, PDL_OVERLAP_NS if name in _PDL else 0)
         # sample_tokens: eager launches after the execute range
-        for i, (name, dur) in enumerate(ks[split:], start=1):
+        for i, (name, dur) in enumerate(step_ks[step_split:], start=1):
             t = cpu + RANGE_NS + 2_000 * i
             c = launch("cudaLaunchKernel_v7000", t, 1_500)
             kernel(name, dur, t + LAUNCH_LATENCY_NS, c, None)
@@ -246,7 +250,8 @@ def _processes_and_gpus(w: _Writer, ranks: list[dict], driver_pid: int) -> None:
 
 def build_trace_db(path: str, ranks: list[dict], measure: tuple[int, int] | None = None,
                    omit_tables: Sequence[str] = (), collide_correlation_ids: bool = True) -> None:
-    """ranks: [{"pid", "device", "tp", "ar_backend", "batch", "steps": [[nc, nct, ng, ngt], ...], "drop_last": 0}].
+    """ranks: [{"pid", "device", "tp", "ar_backend", "batch", "steps": [[nc, nct, ng, ngt], ...], "drop_last": 0}]
+    (optional "short_ar_steps": step indexes that lack their first all-reduce op).
 
     `measure` adds the driver's `tpprof:measure` range (a StartEndRange with a registered string).
     """

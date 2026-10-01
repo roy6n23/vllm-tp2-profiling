@@ -126,13 +126,17 @@ python -m tpprof matrix --estimate
 **Box:**
 
 ```bash
-python -m tpprof run --tier P0 2>&1 | tee -a results/p0.log
+python -m tpprof run --tier P0 2>&1 | tee -ai results/p0.log
 python -m tpprof traces --check
 ```
 
+`tee -i` ignores Ctrl-C, so the runner's cleanup lines still reach the log
+after you stop a run.
+
 `traces --check` prints the completeness gate, the unclassified kernel share
 and the H6 counts for every trace, and exits 1 if any unclassified share is
-≥ 1% or an H6 count is off. **It must pass before P1.** If it fails, fix the
+≥ 1% or if fewer than 99% of a trace's steps have exactly 65 all-reduce ops
+and 1 all-gather (H6, counted from `trace.sqlite`). **It must pass before P1.** If it fails, fix the
 kernel regexes in `tpprof/kernels.py` while the box is up (see
 Troubleshooting).
 
@@ -147,22 +151,24 @@ which is not part of this repository.
 **Box:**
 
 ```bash
-python -m tpprof run --tier P1 2>&1 | tee -a results/p1.log
+python -m tpprof run --tier P1 2>&1 | tee -ai results/p1.log
 python -m tpprof matrix --estimate
-python -m tpprof run --tier P2 2>&1 | tee -a results/p2.log
+python -m tpprof run --tier P2 2>&1 | tee -ai results/p2.log
 ```
 
 Run P2 only as the budget allows (see Time and cost). P1 writes
 `results/raw/rate_grid.json` once its saturation runs are done; the P1 sweeps
 and the P2 serving arms read it.
 
-**Resuming.** After any interruption (a dropped connection that also killed
-tmux, a crash, Ctrl-C), rerun the same `run` command. Runs with a `done.json`
-are skipped. A run stopped by Ctrl-C is marked failed with reason
-`interrupted`; add `--retry-failed` to redo it and any other failed run:
+**Resuming.** After any interruption, rerun the same `run` command. Runs with a
+`done.json` are skipped. A run stopped by Ctrl-C, by `kill` (SIGTERM) or by a
+closed tmux window (SIGHUP) is marked failed with reason `interrupted`, and the
+rerun redoes it. So does a run that a crash or `kill -9` left with no record,
+once the leftover processes tagged with it are killed. A failed preflight is
+also rerun every time. Add `--retry-failed` to redo the other failed runs:
 
 ```bash
-python -m tpprof run --tier P1 --retry-failed 2>&1 | tee -a results/p1.log
+python -m tpprof run --tier P1 --retry-failed 2>&1 | tee -ai results/p1.log
 ```
 
 ## 8. Analyze on the box
@@ -229,6 +235,10 @@ in the RunPod console that the pod is gone.
 | `traces --check` fails on the unclassified share | It lists the top unclassified kernel names. Add regexes for them in `/workspace/vllm-tp2-profiling/tpprof/kernels.py` on the box (tpprof is installed editable), rerun `python -m tpprof traces --check`, then copy the file back: on the Mac, `scp -P <port> root@<ip>:/workspace/vllm-tp2-profiling/tpprof/kernels.py tpprof/kernels.py`. |
 | A preflight gate is wrong, not the box | Override that one gate with a recorded `--skip-gate NAME` on `preflight` and on `run`, e.g. `python -m tpprof run --tier P0 --skip-gate model_files`. The override is written to `preflight.json`. |
 | The SSH connection dropped | The run goes on inside tmux. `ssh -p <port> root@<ip>`, then `tmux attach -t tp2`. |
+| A run failed with `gpus_busy` | GPU memory is held by a process tpprof did not start or could not stop, so the rest of that invocation's GPU runs were skipped (`gpus_busy:<run_id>`). Find it with `nvidia-smi`, kill it, and rerun the same command. |
+| A run failed with `effective_config` | The engine came up configured differently from the spec; the reason names the log line. The run's offline points, if any, are moved to `rejected-points-<n>/` and never analyzed. Fix the cause, then rerun with `--retry-failed`. |
+| A serve session failed with `client_timeout` | A client ran past 3× its own estimate while the server was up, so the engine is probably wedged. The server was stopped; read its `server-*.log`, then rerun with `--retry-failed`. |
+| An M3 run failed with `nccl_unsupported` or `nccl_variant_mismatch` | NCCL rejected the forced algorithm/protocol, or did not use it. `nccl_verify.json` records what NCCL logged. This is a result, not a box problem; it is not retried. |
 
 **Accepting NV12.** `bootstrap_box.sh` takes no arguments, so run a copy with
 `--accept-topology` added to both preflights, and pass it to every `run`:
@@ -238,7 +248,7 @@ sed -e 's/preflight --quick;/preflight --quick --accept-topology;/' \
     -e 's/-m tpprof preflight$/-m tpprof preflight --accept-topology/' \
     /workspace/vllm-tp2-profiling/scripts/bootstrap_box.sh > /tmp/bootstrap_nv12.sh
 bash /tmp/bootstrap_nv12.sh
-python -m tpprof run --tier P0 --accept-topology 2>&1 | tee -a results/p0.log
+python -m tpprof run --tier P0 --accept-topology 2>&1 | tee -ai results/p0.log
 ```
 
 The override is recorded in `preflight.json`. Add a note to the README that

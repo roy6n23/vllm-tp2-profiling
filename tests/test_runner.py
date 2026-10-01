@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
@@ -383,7 +384,9 @@ def test_rate_grid_written_once(tmp_path):
 
 
 @pytest.mark.slow
-def test_interrupt_marks_failed_and_exits_130(tmp_path):
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_interrupt_marks_failed_and_exits_130(tmp_path, sig):
+    """Ctrl-C, and (review I1) SIGTERM from a kill or SIGHUP from a killed tmux window, stop the same way."""
     res = tmp_path / "results"
     port = free_port_base()
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p))
@@ -397,11 +400,11 @@ def test_interrupt_marks_failed_and_exits_130(tmp_path):
     while not os.path.exists(sub) and proc.poll() is None and time.monotonic() < deadline:
         time.sleep(0.05)
     assert proc.poll() is None, open(tmp_path / "runner.log").read()
-    proc.send_signal(signal.SIGINT)
+    proc.send_signal(sig)
     assert proc.wait(timeout=120) == 130, open(tmp_path / "runner.log").read()
     log.close()
     failed = read(os.path.join(str(res), "raw", sat.run_id, "failed.json"))
-    assert failed["reason"] == "interrupted"
+    assert failed["reason"] == "interrupted" and signal.Signals(sig).name in failed["detail"]
     last = read(os.path.join(str(res), "raw", "_last_run.json"))
     assert last["interrupted"] is True and last["failed"] == [sat.run_id]
     assert leftover_fakes(res) == []
@@ -426,3 +429,210 @@ def _own_fake_vllm(port: int) -> list[psutil.Process]:
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
             continue
     return out
+
+
+# ---------------------------------------------------------------- offline points and the engine check (review C1)
+
+LOGS = ROOT / "tests" / "fixtures" / "logs"
+OFFLINE_TP1 = matrix.RunSpec("offline", "TP1", "base", "P0", {"points": "decode:b1,b8"})
+
+
+def box_ctx(results_dir, engine_log) -> runner.RunContext:
+    """The dry-run context with the effective-config check on, as on the box: the fake engine prints a real
+    engine's startup lines (FAKE_ENGINE_LOG)."""
+    ctx = make_ctx(results_dir, FAKE_ENGINE_LOG=str(engine_log))
+    ctx.dry_run = False
+    return ctx
+
+
+def point_files(run_dir) -> dict[str, float]:
+    """Point file name -> the t_wall_start the driver recorded in it."""
+    d = os.path.join(run_dir, "points")
+    if not os.path.isdir(d):
+        return {}
+    return {n: read(os.path.join(d, n))["tpprof"]["t_wall_start"] for n in sorted(os.listdir(d))}
+
+
+def test_offline_config_violation_quarantines_points_and_retry_remeasures(tmp_path):
+    res = tmp_path / "results"
+    r = runner.Runner(box_ctx(res, LOGS / "tp1_sampling_override.log"))
+    assert r.run_spec(OFFLINE_TP1) == "failed" and r.last_reason == "effective_config"
+    d = os.path.join(str(res), "raw", OFFLINE_TP1.run_id)
+    assert point_files(d) == {}                  # a misconfigured engine's points are not data
+    rejected = [n for n in os.listdir(d) if n.startswith("rejected-points")]
+    assert len(rejected) == 1 and len(os.listdir(os.path.join(d, rejected[0]))) == 4
+
+    t_retry = time.time()
+    r = runner.Runner(box_ctx(res, LOGS / "tp1_base.log"))
+    r.retry_failed = True
+    assert r.run_spec(OFFLINE_TP1) == "done", r.last_reason
+    points = point_files(d)
+    assert len(points) == 4 and min(points.values()) >= t_retry      # measured again, by the vetted engine
+    assert read(os.path.join(d, "effective_config.json"))["violations"] == []
+
+
+def test_offline_retry_with_every_point_vetted_skips_the_driver(tmp_path):
+    res = tmp_path / "results"
+    ctx = box_ctx(res, LOGS / "tp1_base.log")
+    assert runner.Runner(ctx).run_spec(OFFLINE_TP1) == "done"
+    d = os.path.join(str(res), "raw", OFFLINE_TP1.run_id)
+    before = point_files(d)
+    # the driver wrote every point with a vetted engine, then failed (say, a timeout in engine teardown)
+    os.remove(os.path.join(d, "done.json"))
+    with open(os.path.join(d, "failed.json"), "w") as f:
+        json.dump({"run_id": OFFLINE_TP1.run_id, "status": "failed", "reason": "timeout", "detail": "",
+                   "log_tails": {}}, f)
+    r = runner.Runner(ctx)
+    r.retry_failed = True
+    assert r.run_spec(OFFLINE_TP1) == "done", r.last_reason
+    assert point_files(d) == before
+    assert read(os.path.join(d, "effective_config.json"))["violations"] == []
+    assert not os.path.exists(os.path.join(d, "offline.log"))        # the driver was not started again
+
+
+def test_rerun_after_a_failed_preflight_runs_it_again_with_the_new_gate_options(tmp_path):
+    """Review I3: RUN_ON_GPU.md's recovery is the same command plus --accept-topology or --skip-gate."""
+    res = tmp_path / "results"
+    kinds = ("preflight", "envcapture")
+    pf = next(s for s in matrix.p0_specs() if s.kind == "preflight")
+    ctx = make_ctx(res, FAKE_NVSMI_SCENARIO="nv12")
+    summary = runner.Runner(ctx).run_tiers(["P0"], only_kinds=kinds)
+    assert summary["failed"] == [pf.run_id]
+    ctx.accept_topology = True
+    summary = runner.Runner(ctx).run_tiers(["P0"], only_kinds=kinds)
+    assert summary["failed"] == [] and summary["skipped"] == [], summary
+    assert pf.run_id in summary["done"]
+
+
+def test_shutdown_lines_the_stop_provokes_do_not_fail_a_finished_run(tmp_path):
+    """Review I5: the final engine check reads the server logs only up to the stop the runner itself sent."""
+    res = tmp_path / "results"
+    ctx = make_ctx(res, FAKE_VLLM_SHUTDOWN_LINE="Worker proc VllmWorker-0 died unexpectedly, shutting down executor.")
+    smoke = next(s for s in matrix.p0_specs() if s.kind == "smoke" and s.config == "TP2")
+    r = runner.Runner(ctx)
+    assert r.run_spec(smoke) == "done", r.last_reason
+    d = os.path.join(str(res), "raw", smoke.run_id)
+    [log] = [n for n in os.listdir(d) if n.startswith("server-") and n.endswith(".log")]
+    assert "died unexpectedly" in open(os.path.join(d, log)).read()       # logged, but after the stop
+    assert read(os.path.join(d, "effective_config.json"))["violations"] == []
+
+
+def test_resume_after_a_hard_kill_sweeps_orphans_and_sets_the_attempt_aside(tmp_path):
+    """Review I1: a runner killed without cleanup leaves a run dir with neither done.json nor failed.json,
+    orphans tagged with its run_id, and logs the next attempt would append to."""
+    res = tmp_path / "results"
+    ctx = make_ctx(res)
+    smoke = next(s for s in matrix.p0_specs() if s.kind == "smoke" and s.config == "TP1")
+    d = os.path.join(str(res), "raw", smoke.run_id)
+    server_log = f"server-{ctx.port_base}.log"
+    os.makedirs(os.path.join(d, "sub-0"))
+    with open(os.path.join(d, "spec.json"), "w") as f:
+        json.dump(smoke.to_dict(), f)
+    with open(os.path.join(d, "cmd.json"), "w") as f:
+        json.dump([{"argv": ["the-killed-attempt"], "log": server_log}], f)
+    shutil.copy(LOGS / "tp1_base.log", os.path.join(d, server_log))
+    orphan = subprocess.Popen([PY, "-c", "import time; time.sleep(120)"], start_new_session=True,
+                              env=dict(os.environ, TPPROF_RUN_ID=smoke.run_id))
+    try:
+        summary = runner.Runner(ctx).run_tiers(["P0"], only_kinds=("smoke",))
+        assert orphan.wait(timeout=10) is not None                # killed by the runner, not by this test
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait()
+    assert smoke.run_id in summary["done"], summary
+    assert read(os.path.join(d, "effective_config.json"))["violations"] == []
+    assert sorted(os.listdir(os.path.join(d, "prev-attempt"))) == sorted(["cmd.json", server_log, "sub-0"])
+    assert all(c["argv"] != ["the-killed-attempt"] for c in read(os.path.join(d, "cmd.json")))
+
+
+def test_after_gpus_busy_the_invocation_skips_its_other_gpu_runs(tmp_path, monkeypatch):
+    """Review I1: one busy pre-check stops the invocation's GPU runs instead of waiting before each of them."""
+    monkeypatch.setattr(runner, "GPU_PRECHECK_TIMEOUT_S", 0.5)
+    res = tmp_path / "results"
+    summary = runner.Runner(make_ctx(res, FAKE_NVSMI_SCENARIO="busy")).run_tiers(["P0"], only_kinds=("smoke",))
+    smokes = [s.run_id for s in matrix.p0_specs() if s.kind == "smoke"]
+    assert summary["failed"] == smokes[:1]
+    reasons = skipped_reasons(summary)
+    assert [reasons.get(r) for r in smokes[1:]] == [f"gpus_busy:{smokes[0]}"] * 2
+
+
+def test_a_client_timeout_stops_the_session(tmp_path, monkeypatch):
+    """Review I2: a client still running at its own timeout ends the session (the engine may be wedged); the
+    next clients do not each wait that long again behind an invalid sub-run."""
+    monkeypatch.setattr(runner, "MIN_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(runner, "TIMEOUT_FACTOR", 0.0)
+    res = tmp_path / "results"
+    ctx = make_ctx(res, FAKE_VLLM_TTFT_S="2000")            # 4 s per request at the dry-run time scale
+    sat = next(s for s in matrix.p1_sat_specs() if s.kind == "serve_session")
+    r = runner.Runner(ctx)
+    t0 = time.monotonic()
+    assert r.run_spec(sat) == "failed" and r.last_reason == "client_timeout"
+    d = os.path.join(str(res), "raw", sat.run_id)
+    assert sorted(n for n in os.listdir(d) if n.startswith("sub-")) == ["sub-0"]
+    assert time.monotonic() - t0 < 60
+    assert leftover_fakes(res) == []
+
+
+def test_a_saturation_session_without_a_valid_run_fails(tmp_path):
+    """Review I2: a done sat session with no valid sub-run would block P1 for good: the rate grid can never be
+    computed, and --retry-failed does not redo done runs."""
+    res = tmp_path / "results"
+    ctx = make_ctx(res, FAKE_VLLM_PROMPT_TOKENS="999")      # every request reports the wrong input length
+    sat = next(s for s in matrix.p1_sat_specs() if s.kind == "serve_session")
+    r = runner.Runner(ctx)
+    assert r.run_spec(sat) == "failed" and r.last_reason == "no_valid_saturation_run"
+    assert leftover_fakes(res) == []
+
+
+# ---------------------------------------------------------------- M3 NCCL verification (review I6, spec 4.6)
+
+def m3_spec(variant: str) -> matrix.RunSpec:
+    return next(s for s in matrix.p2_specs(None, "mnnvl", True) if s.kind == "comm_m3" and s.p("variant") == variant)
+
+
+def test_m3_variant_is_verified_from_nccl_tuning_lines(tmp_path):
+    """A short diagnostic run of the variant under NCCL_DEBUG=INFO must show the requested algorithm and protocol
+    in NCCL's TUNING lines; the loaded NCCL version and the NVLS multicast line are recorded."""
+    res = tmp_path / "results"
+    spec = m3_spec("ring:LL")
+    r = runner.Runner(make_ctx(res))
+    assert r.run_spec(spec) == "done", r.last_reason
+    d = os.path.join(str(res), "raw", spec.run_id)
+    v = read(os.path.join(d, "nccl_verify.json"))
+    assert v["verified"] is True and v["observed"] == {"algos": ["RING"], "protos": ["LL"]}
+    assert v["nccl_version"] == constants.NCCL_EXPECTED and v["nvls_support"] is True
+    assert os.path.exists(os.path.join(d, "comm_rows.jsonl"))
+
+
+def test_m3_variant_nccl_did_not_run_fails_without_rows(tmp_path):
+    res = tmp_path / "results"
+    spec = m3_spec("ring:LL")
+    r = runner.Runner(make_ctx(res, FAKE_NCCL_TUNING_ALGO="TREE"))
+    assert r.run_spec(spec) == "failed" and r.last_reason == "nccl_variant_mismatch"
+    assert not os.path.exists(os.path.join(str(res), "raw", spec.run_id, "comm_rows.jsonl"))
+
+
+def test_m3_variant_nccl_rejects_is_recorded_as_unsupported(tmp_path):
+    res = tmp_path / "results"
+    spec = m3_spec("tree:LL128")
+    r = runner.Runner(make_ctx(res, FAKE_NCCL_UNSUPPORTED="tree:LL128"))
+    assert r.run_spec(spec) == "failed" and r.last_reason == "nccl_unsupported"
+    assert read(os.path.join(str(res), "raw", spec.run_id, "nccl_verify.json"))["unsupported"] is True
+
+
+def test_m3_nvls_bind_failure_is_retried_without_nvls(tmp_path):
+    res = tmp_path / "results"
+    ctx = make_ctx(res, FAKE_NCCL_NVLS_BIND_FAIL="1")
+    spec = m3_spec("ring:LL")
+    r = runner.Runner(ctx)
+    assert r.run_spec(spec) == "done", r.last_reason
+    d = os.path.join(str(res), "raw", spec.run_id)
+    assert read(os.path.join(d, "nccl_verify.json"))["nvls_disabled_retry"] is True
+    first, retry = read(os.path.join(d, "cmd.json"))[:2]
+    assert (first["exit_code"], retry["exit_code"]) == (1, 0)
+    assert retry["env_overrides"].get("NCCL_NVLS_ENABLE") == "0"
+    # NVLS itself cannot run without NVLS: unsupported, not retried
+    nvls = m3_spec("nvls:Simple")
+    r = runner.Runner(ctx)
+    assert r.run_spec(nvls) == "failed" and r.last_reason == "nccl_unsupported"

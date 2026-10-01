@@ -637,6 +637,9 @@ def serve_main(argv: list[str]) -> int:
             if cfg.api_servers == 1:
                 state.stats_lines(now - last)
             last = now
+        shutdown_line = os.environ.get("FAKE_VLLM_SHUTDOWN_LINE")
+        if shutdown_line:            # a line the stop itself provokes, e.g. a worker that lost the shutdown race
+            log(cfg.engine_names()[0], "ERROR", "multiproc_executor.py:309", shutdown_line)
         log.uvicorn("Shutting down")
         log.uvicorn("Waiting for application shutdown.")
         log.uvicorn("Application shutdown complete.")
