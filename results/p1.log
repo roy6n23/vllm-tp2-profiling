@@ -1,0 +1,91 @@
+run    P1-serve_session-TP1-base-r0-297826c7
+       sub-0 sat rate inf seed 1: valid [preempted, throttled]
+       sub-1 sat rate inf seed 2: valid [preempted, throttled]
+       sub-2 sat rate inf seed 3: valid [preempted, throttled]
+done   P1-serve_session-TP1-base-r0-297826c7 (639.6 s)
+run    P1-serve_session-TP2-base-r0-d52c5a40
+       sub-0 sat rate inf seed 1: valid [preempted, throttled]
+       sub-1 sat rate inf seed 2: valid [preempted, throttled]
+       sub-2 sat rate inf seed 3: valid [preempted, throttled]
+done   P1-serve_session-TP2-base-r0-d52c5a40 (381.2 s)
+run    P1-serve_session-DP2-base-r0-3ecb2c9a
+       sub-0 sat rate inf seed 1: valid [preempted, throttled]
+       sub-1 sat rate inf seed 2: valid [preempted, throttled]
+       sub-2 sat rate inf seed 3: valid [preempted, throttled]
+done   P1-serve_session-DP2-base-r0-3ecb2c9a (358.4 s)
+run    P1-tokbench-none-none-r0-f575cfd6
+done   P1-tokbench-none-none-r0-f575cfd6 (6.5 s)
+rate grid written to /workspace/vllm-tp2-profiling/results/raw/rate_grid.json: mu_rps {'TP1': 19.980257647530276, 'TP2': 39.54064382394862, 'DP2': 43.77393202021009}
+run    P1-serve_session-TP1-base-r1-ff44617a
+       sub-0 sweep rate 4.0 seed 1000: valid [throttled]
+       sub-1 sweep rate 7.99 seed 1001: valid [throttled]
+       sub-2 sweep rate 11.99 seed 1002: valid [throttled]
+       sub-3 sweep rate 14.99 seed 1003: valid [throttled]
+       sub-4 sweep rate 16.98 seed 1004: valid [throttled]
+       sub-5 sweep rate 18.98 seed 1005: valid [throttled]
+done   P1-serve_session-TP1-base-r1-ff44617a (709.0 s)
+run    P1-serve_session-TP2-base-r1-eba6bf58
+       sub-0 sweep rate 7.91 seed 1000: valid [throttled]
+       sub-1 sweep rate 15.82 seed 1001: valid [throttled]
+       sub-2 sweep rate 23.72 seed 1002: valid [throttled]
+       sub-3 sweep rate 29.66 seed 1003: valid [throttled]
+       sub-4 sweep rate 33.61 seed 1004: valid [throttled]
+       sub-5 sweep rate 37.56 seed 1005: INVALID: failed=5 (must be 0) [throttled]
+done   P1-serve_session-TP2-base-r1-eba6bf58 (735.2 s)
+run    P1-serve_session-DP2-base-r1-0963bb64
+       sub-0 sweep rate 8.75 seed 1000: valid [throttled]
+       sub-1 sweep rate 17.51 seed 1001: valid [throttled]
+       sub-2 sweep rate 26.26 seed 1002: valid [throttled]
+       sub-3 sweep rate 32.83 seed 1003: valid [throttled]
+       sub-4 sweep rate 37.21 seed 1004: valid [throttled]
+       sub-5 sweep rate 41.59 seed 1005: INVALID: failed=2 (must be 0) [throttled]
+done   P1-serve_session-DP2-base-r1-0963bb64 (756.9 s)
+run    P1-serve_session-TP2-base-r2-2008e985
+       sub-0 sweep rate 7.91 seed 2000: valid [throttled]
+       sub-1 sweep rate 15.82 seed 2001: valid [throttled]
+       sub-2 sweep rate 23.72 seed 2002: valid [throttled]
+       sub-3 sweep rate 29.66 seed 2003: valid [throttled]
+       sub-4 sweep rate 33.61 seed 2004: valid [throttled]
+       sub-5 sweep rate 37.56 seed 2005: valid [throttled]
+done   P1-serve_session-TP2-base-r2-2008e985 (736.8 s)
+run    P1-serve_session-DP2-base-r2-da3a80af
+       sub-0 sweep rate 8.75 seed 2000: valid [throttled]
+       sub-1 sweep rate 17.51 seed 2001: valid [throttled]
+       sub-2 sweep rate 26.26 seed 2002: valid [throttled]
+       sub-3 sweep rate 32.83 seed 2003: valid [throttled]
+       sub-4 sweep rate 37.21 seed 2004: valid [throttled]
+       sub-5 sweep rate 41.59 seed 2005: valid [throttled]
+done   P1-serve_session-DP2-base-r2-da3a80af (754.2 s)
+run    P1-serve_session-TP1-base-r2-db67c171
+       sub-0 sweep rate 4.0 seed 2000: valid [throttled]
+       sub-1 sweep rate 7.99 seed 2001: valid [throttled]
+       sub-2 sweep rate 11.99 seed 2002: valid [throttled]
+       sub-3 sweep rate 14.99 seed 2003: valid [throttled]
+       sub-4 sweep rate 16.98 seed 2004: valid [throttled]
+       sub-5 sweep rate 18.98 seed 2005: valid [throttled]
+done   P1-serve_session-TP1-base-r2-db67c171 (709.1 s)
+run    P1-serve_session-DP2-base-r3-18f5057b
+       sub-0 sweep rate 8.75 seed 3000: valid [throttled]
+       sub-1 sweep rate 17.51 seed 3001: valid [throttled]
+       sub-2 sweep rate 26.26 seed 3002: valid [throttled]
+       sub-3 sweep rate 32.83 seed 3003: valid [throttled]
+       sub-4 sweep rate 37.21 seed 3004: valid [throttled]
+       sub-5 sweep rate 41.59 seed 3005: valid [throttled]
+done   P1-serve_session-DP2-base-r3-18f5057b (753.2 s)
+run    P1-serve_session-TP1-base-r3-c40c4ab3
+       sub-0 sweep rate 4.0 seed 3000: valid [throttled]
+       sub-1 sweep rate 7.99 seed 3001: valid [throttled]
+       sub-2 sweep rate 11.99 seed 3002: valid [throttled]
+       sub-3 sweep rate 14.99 seed 3003: valid [throttled]
+       sub-4 sweep rate 16.98 seed 3004: valid [throttled]
+       sub-5 sweep rate 18.98 seed 3005: INVALID: failed=1 (must be 0) [throttled]
+done   P1-serve_session-TP1-base-r3-c40c4ab3 (710.9 s)
+run    P1-serve_session-TP2-base-r3-ff5dc3c3
+       sub-0 sweep rate 7.91 seed 3000: valid [throttled]
+       sub-1 sweep rate 15.82 seed 3001: valid [throttled]
+       sub-2 sweep rate 23.72 seed 3002: valid [throttled]
+       sub-3 sweep rate 29.66 seed 3003: valid [throttled]
+       sub-4 sweep rate 33.61 seed 3004: valid [throttled]
+       sub-5 sweep rate 37.56 seed 3005: valid [throttled]
+done   P1-serve_session-TP2-base-r3-ff5dc3c3 (737.8 s)
+13 done, 0 failed, 0 skipped (/workspace/vllm-tp2-profiling/results/raw/_last_run.json)

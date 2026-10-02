@@ -7,13 +7,11 @@ harness, `tpprof`, runs offline step-time sweeps, online serving sweeps, Nsight
 Systems traces and all-reduce microbenchmarks, then turns the run records into
 tidy CSVs, figures and a hypothesis report.
 
-> **Status (2026-09-30):** the harness is complete and tested without a GPU:
-> unit tests, integration tests against fake `vllm` / `nvidia-smi` / `nsys` /
-> `torchrun` executables, a full P0–P2 dry run through analysis and report, and
-> contract tests against the real vLLM 0.30.0 CLI in a CPU container. **No GPU
-> run has happened yet, so no performance numbers exist yet.** The a-priori
-> predictions are committed in [predictions.md](predictions.md) (git tag
-> `predictions-v1`) before any hardware is rented.
+> **Status (2026-10-02):** the full P0–P2 matrix ran on a 2× H100 SXM box
+> (RunPod, US-NE-1). Results are below and in [results/SUMMARY.md](results/SUMMARY.md);
+> the raw run records and traces are attached to the
+> [`results-2026-10-02` release](https://github.com/roy6n23/vllm-tp2-profiling/releases/tag/results-2026-10-02).
+> The predictions were committed beforehand ([predictions.md](predictions.md), tag `predictions-v1`).
 
 ## The question
 
@@ -32,6 +30,75 @@ The two deliverables:
    two replicas do, and above which the replicas win.
 2. A mechanism-level account, taken from traces, of why TP2 falls short of 2×:
    communication time, fixed per-step work, and GEMV efficiency.
+
+## Results (2026-10-02)
+
+**Box.** 2× H100 80GB HBM3 SXM joined by NV18, driver 580.126.09, the pinned
+vLLM 0.30.0 image (torch 2.13.0+cu130, FlashInfer 0.6.18.post1; the TP2 baseline
+used FlashInfer's `mnnvl` fused all-reduce). P0–P2 took 0.7 + 2.2 + 1.2 h.
+
+**Headline.**
+
+- **s\* = 17.69 ms** TPOT (median over 3 rounds; range 12.31–18.04 ms). Below
+  it, TP2 gets more goodput from two GPUs than two replicas do; above it, DP2 wins.
+- TP2 decode speedup over TP1: **1.54×** at batch 1, 1.70× at batch 128.
+  Prefill: 1.21× at 512 tokens, 1.60× at 8192.
+- DP2 / TP2 saturation throughput: **1.107** (every seed).
+- Every traced TP2 step had exactly **65 all-reduces + 1 all-gather**
+  (8 traces, 3604 rank-steps), as Megatron-style TP predicts (32 layers × 2 + 1).
+
+| id | Measured | Predicted band | Verdict |
+|---|---|---|---|
+| H1 | 1.542 | 1.499–1.671 | hit |
+| H2 | decode +0.081, prefill +0.196 (CIs exclude 0) | decode 0.052–0.067, prefill 0.080–0.100 | hit (the rule is "> 0"; both rises are larger than modelled) |
+| H3 | 1.107 in every seed | 1.126–1.220 | hit (DP2 > TP2 in every seed; the ratio is below the band) |
+| H4 | s\* range 12.31–18.04 ms | 13.92–15.30 ms | hit, but only through round 2 (below) |
+| H5 | 2.283 | 2.258–2.269 | **miss** |
+| H6 | 100% of rank-steps exact | structural | hit |
+| H7 | idle 0.039 / 0.208 / 0.252 (base / G1 / G2) | < 0.10, > 0.30 for G2, ordered | **miss** (G2 is 0.252, not > 0.30) |
+| H8 | 1.087 | 1.050–1.092 | hit |
+
+The misses are explained in [WORKLOG](WORKLOG.md) (2026-10-02): H5's model
+overstated non-KV memory and gave TP2 more of it than TP1 (measured 2.40 vs
+2.51 GiB per GPU); H7's threshold assumed eager mode only adds launch gaps,
+but it also roughly 2.6× the GPU work per step.
+
+**Read these numbers with:**
+
+- **H4 rests on round 2.** Rounds 1 and 3 (17.69, 18.04 ms), the median and the
+  pooled-request s\* (18.93 ms) are all 2.4–3.6 ms above the predicted band.
+  Round 2's 12.31 ms comes from one TP2 run whose Poisson arrivals ran about
+  18% above the mean for ~18 s. The request-level bootstrap CIs (±0.1–0.3 ms)
+  only cover noise within a run; the range over rounds is the real uncertainty.
+- **The API server is the hot spot, not the client.** During the benchmark
+  phase the client's CPU p90 is 12–67% of a core. DP2's single API server
+  feeding two engines reaches 102–117% at saturation, yet a second API server
+  (arm API2) changes saturation throughput by ≤ 0.1%. The client adds 7–45 ms
+  to TTFT at the sweep rates; no request misses the 1 s TTFT SLO, so goodput
+  and s\* are set by TPOT.
+- **Power, not heat.** Runs are flagged `throttled` by the power cap
+  (~700 W draw); no thermal throttle reason appeared, max 68 °C.
+- **Excluded data.** Three sweep sub-runs at the top rate had 1–5 client-side
+  connection errors out of thousands of requests and are marked invalid. The
+  two API2 sessions were rerun after a harness fix: vLLM 0.30.0 exposes no
+  `/metrics` gauges with `--api-server-count 2`.
+- **Hosts.** Two earlier boxes (RunPod AP-IN-1) advertised NVSwitch multicast
+  but failed to bind it (CUDA error 401), so every TP2 engine died in NCCL
+  init. The full preflight now runs a real two-GPU all-reduce
+  (`nccl_allreduce`) and names that fault; no number above comes from those
+  boxes.
+
+**Data.** [results/SUMMARY.md](results/SUMMARY.md) has every table and the
+figures; `results/tidy/*.csv` are the tidy tables. The `raw/` run records
+(436 MB, zstd) and the Nsight Systems traces (252 MB) are release assets. To
+regenerate the report from them:
+
+```bash
+gh release download results-2026-10-02 -R roy6n23/vllm-tp2-profiling
+tar --zstd -xf results-2026-10-02-raw.tar.zst -C results/ && tar -xf results-2026-10-02-traces.tar -C results/
+find results/raw -name 'trace.sqlite.zst' -exec zstd -q -d {} \;
+python -m tpprof report
+```
 
 ## What was learned before any GPU
 
@@ -291,7 +358,7 @@ third_party/vllm_benchmarks/  vendored vLLM v0.30.0 benchmark scripts (Apache-2.
 tests/                      unit, integration and contract tests; fixtures from the real 0.30.0 CLI
   fake_bin/                 fake vllm, nvidia-smi, nsys, torchrun
 docker/                     CPU image with the real vLLM 0.30.0 CLI for the contract tests
-results/                    run records from the box (after the GPU run)
+results/                    SUMMARY.md, tidy CSVs, figures, tier logs (raw/ and traces: release assets)
 ```
 
 ## Limitations known in advance
@@ -303,9 +370,9 @@ results/                    run records from the box (after the GPU run)
   H100. Traces are used for counts and shares, never for headline latency.
   Each traced step time is compared with the untraced median, and the ratio is
   reported.
-- **One box, one provider.** All numbers will come from one rented 2× H100 SXM
-  slice on RunPod Secure Cloud, in one session. Box-to-box variation is not
-  measured.
+- **One box, one provider.** All numbers come from one rented 2× H100 SXM
+  slice on RunPod Secure Cloud (US-NE-1), in one session. Box-to-box variation
+  is not measured.
 - **DP routing is vLLM's internal load balancer.** DP2 results include vLLM's
   queue-load routing. The random-split arm (A-RAND) shows how much that
   routing matters, but other routers are not tested.

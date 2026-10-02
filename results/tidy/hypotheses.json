@@ -1,0 +1,100 @@
+[
+ {
+  "id": "H1",
+  "statement": "TP2 decode speedup over TP1 at batch 1 lies inside the model band",
+  "measured": 1.5424731565873402,
+  "band": [
+   1.499,
+   1.671
+  ],
+  "verdict": "hit",
+  "note": "TP1/base 6.292 ms vs TP2/base 4.079 ms at batch 1"
+ },
+ {
+  "id": "H2",
+  "statement": "TP2 scaling efficiency e = speedup/2 rises with tokens per step, in decode and in prefill",
+  "measured": {
+   "decode": 0.08083096012219126,
+   "prefill": 0.1962834232262899
+  },
+  "band": {
+   "decode": [
+    0.05229,
+    0.06693
+   ],
+   "prefill": [
+    0.08002,
+    0.09991
+   ]
+  },
+  "verdict": "hit",
+  "note": "decode e(128) - e(1) = 0.08083, 95% CI [0.0771, 0.0834]; prefill e(8192) - e(512) = 0.1963, 95% CI [0.1693, 0.2055]"
+ },
+ {
+  "id": "H3",
+  "statement": "DP2's saturation throughput exceeds TP2's in every seed",
+  "measured": 1.1070616911325426,
+  "band": [
+   1.126,
+   1.22
+  ],
+  "verdict": "hit",
+  "note": "DP2/TP2 per seed: 1: 1.110, 2: 1.107, 3: 1.106"
+ },
+ {
+  "id": "H4",
+  "statement": "A goodput crossover s* exists (TP2 wins below, DP2 above); the measured range overlaps the band",
+  "measured": [
+   12.313216006486016,
+   18.04048540885826
+  ],
+  "band": [
+   13.92,
+   15.3
+  ],
+  "verdict": "hit",
+  "note": "s* range 12.31-18.04 ms over 3/3 rounds"
+ },
+ {
+  "id": "H5",
+  "statement": "TP2's KV capacity per engine is inside the model band relative to TP1's (warm boots)",
+  "measured": 2.282700421940928,
+  "band": [
+   2.258,
+   2.269
+  ],
+  "verdict": "miss",
+  "note": "median warm KV tokens TP2 1004096 (10 boots) / TP1 439872 (9 boots)"
+ },
+ {
+  "id": "H6",
+  "statement": "Every traced TP2 step has exactly 65 all-reduce ops and 1 all-gather (>= 99% of steps, all arms)",
+  "measured": 1.0,
+  "band": null,
+  "verdict": "hit",
+  "note": "8 traces, 3604 rank-steps; exact fraction in [1.0000, 1.0000]"
+ },
+ {
+  "id": "H7",
+  "statement": "TP2 decode bs-1 GPU idle_est < 0.10 (base), > 0.30 (G2), ordered base < G1 < G2",
+  "measured": {
+   "base": 0.038952319842270544,
+   "G1": 0.2078627376766924,
+   "G2": 0.251957415325589
+  },
+  "band": null,
+  "verdict": "miss",
+  "note": "base 0.039, G1 0.208, G2 0.252"
+ },
+ {
+  "id": "H8",
+  "statement": "AR3 (pure NCCL) / AR0 decode step ratio at batch 1 lies inside the model band",
+  "measured": 1.08726465436449,
+  "band": [
+   1.05,
+   1.092
+  ],
+  "verdict": "hit",
+  "note": "TP2/AR3 4.435 ms vs TP2/base 4.079 ms at batch 1"
+ }
+]

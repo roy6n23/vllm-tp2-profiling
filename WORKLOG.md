@@ -106,15 +106,76 @@ failure strings fail a run. Each module then went through code review before
 merge; the fix rounds are in the git history.
 
 **Open for the first GPU run:**
-- [ ] Quick preflight on a real box: NV18, 700 W, fabric registered, `/dev/shm`; record the multicast attribute.
-- [ ] Which FlashInfer backend the TP2 baseline picks (`mnnvl` or `trtllm`), from the workspace log line. It decides whether A-FIB and the NVLS M3 variant run.
-- [ ] The effective-config log lines on the box match the patterns taken from source, per arm (backend list, `Enabled custom fusions: allreduce_rms`, the workspace line).
-- [ ] Real kernel names in the P0 traces vs the categorizer: `traces --check` must show an unclassified share < 1% and H6 (>= 99% of steps exact). The name fixtures come from source, not from a real trace.
-- [ ] Trace overhead ratio (traced vs untraced step time) with node-level graph tracing.
-- [ ] The model file gate passes on the real download.
-- [ ] TP1 decode batch 1 on GPU1 vs GPU0 (the DP2 derivation is flagged if they differ by ≥ 1%).
-- [ ] The offline driver vs `vllm bench latency` cross-check at batch 8 (within 3% expected).
-- [ ] Estimated vs actual wall time per tier; update the estimator if it is off.
+- [x] Quick preflight on a real box: NV18, 700 W, fabric registered, `/dev/shm`; record the multicast attribute. (2026-10-02: all pass; multicast True)
+- [x] Which FlashInfer backend the TP2 baseline picks (`mnnvl` or `trtllm`), from the workspace log line. It decides whether A-FIB and the NVLS M3 variant run. (`mnnvl`, no fallback)
+- [x] The effective-config log lines on the box match the patterns taken from source, per arm (backend list, `Enabled custom fusions: allreduce_rms`, the workspace line). (no `effective_config` failure on the US-NE-1 box)
+- [x] Real kernel names in the P0 traces vs the categorizer: `traces --check` must show an unclassified share < 1% and H6 (>= 99% of steps exact). The name fixtures come from source, not from a real trace. (unclassified <= 0.29%, H6 100%)
+- [x] Trace overhead ratio (traced vs untraced step time) with node-level graph tracing. (traced mean step 1.1-6.4x the untraced median, varying by run; traces are used for counts and shares only)
+- [x] The model file gate passes on the real download.
+- [x] TP1 decode batch 1 on GPU1 vs GPU0 (the DP2 derivation is flagged if they differ by ≥ 1%). (0.40%)
+- [x] The offline driver vs `vllm bench latency` cross-check at batch 8 (within 3% expected). (TP1 -0.01%, TP2 +2.02%)
+- [ ] Estimated vs actual wall time per tier; update the estimator if it is off. (P0 0.7 h vs 1.3 h estimated, P1 2.2 vs 2.3, P2 1.2 vs 2.1: comm and trace runs are overestimated; estimator not updated yet)
 - [ ] The a-posteriori fit: memory efficiency and fixed per-step time from TP1 only, α and β from M2 and M3; TP2 as an out-of-sample prediction.
-- [ ] Mark H1–H8 hit or miss against `predictions.md`, with one entry here per miss.
-- [ ] Fill in the evidence paths of the confounder ledger.
+- [x] Mark H1–H8 hit or miss against `predictions.md`, with one entry here per miss. (H5 and H7 missed, entry below)
+- [x] Fill in the evidence paths of the confounder ledger. (results/SUMMARY.md, "Confounder evidence")
+
+## 2026-10-02: the GPU run (three boxes, one usable)
+
+**Boxes.** The first two RunPod pods (AP-IN-1) passed the quick preflight but
+every TP2 engine died in `ncclCommInitRank`: NVLS multicast binding failed with
+CUDA error 401 ("the operation cannot be performed in the present state"),
+while the same all-reduce worked with `NCCL_NVLS_ENABLE=0`. The `multicast`
+check only read the attribute. The full preflight now runs a real two-GPU
+all-reduce (`nccl_allreduce`) and, if it fails, retries with NVLS off to name
+the fault; it caught the second box. The third pod (US-NE-1) was clean. No
+result comes from the first two.
+
+**Harness fixes found on the box** (each with a test that failed first):
+- The trace completeness gate counted vLLM's empty scheduler step
+  (`execute_context_0(0)_generation_0(0)`, opened after the last request
+  finishes, no kernels) as a truncated step and failed every TP1 trace.
+- `flashinfer_jit_cache` compared versions exactly; the image ships `+cu130`.
+- `scripts/runpod.py` got 403 / Cloudflare 1010 for urllib's default User-Agent.
+- With `--api-server-count 2`, vLLM 0.30.0 disables stats logging and exposes no
+  `/metrics` gauges, so both API2 sessions failed in the gauge poller. Such
+  servers now run on the counters alone (`no_gauges`); the two sessions were
+  rerun.
+- The report paired the median of the round s\* values with the bootstrap CI of
+  the pooled-request s\*, a different estimator (17.69 vs CI 18.82-19.03 around
+  18.93). Both are now reported, each with its own label.
+- The client CPU p90 included 10-15 s of client startup at 100%+, which put
+  ~100% on every run; it is now taken over the benchmark phase (12-67%).
+
+**H5 miss (KV capacity ratio 2.283 vs 2.258-2.269).** The wrong term is the
+non-KV memory per GPU. Measured from the engines' available-KV lines:
+71.20 GiB requested - weights - available KV = 2.51 GiB for TP1 and 2.40 GiB
+for TP2. The model's central values were 4.82 and 5.40 GiB, and every constant
+set gave TP2 more non-KV memory than TP1 (NCCL and communication buffers). On
+this box TP2 has less: halving the per-GPU activations saves more than the
+communication buffers cost. The band was narrow because it only varied the
+size of that overhead, not the sign of TP2 - TP1.
+
+**H7 miss (G2 idle 0.252, predicted > 0.30).** The other two statements held
+(base 0.039 < 0.10; 0.039 < 0.208 < 0.252). The threshold assumed `--enforce-eager`
+only adds CPU launch gaps on top of the same GPU work. From the traces, GPU
+busy time per step is about 4.08 x (1 - 0.039) = 3.9 ms in the baseline and
+13.8 x (1 - 0.252) = 10.3 ms in G2, so eager mode also does about 2.6x the GPU
+work (no compile, no fusion). More GPU work per step leaves a smaller idle
+share. Not explained yet: G1 (graphs off, fusion kept) also shows about
+11.1 x (1 - 0.208) = 8.8 ms of GPU busy time. Next step: compare kernel counts
+and categories between the base, G1 and G2 traces.
+
+**H4 is a hit only through round 2.** The rule is range overlap: 12.31-18.04
+overlaps 13.92-15.30. Rounds 1 and 3, the median and the pooled value are
+2.4-3.6 ms above the band. Round 2's TP2 run at 29.66 req/s (seed 2003) had
+arrivals about 18% above the mean for ~18 s (deciles 7-8). There, 80% of
+requests had TPOT above 15 ms, so its attainment at 15 ms was 0.813. The
+model's s\* is 2.4-3.6 ms too low (median and pooled value vs the band's top).
+
+**Cost.** RunPod billed $53.16 for the three pods (pod 3: 6.8 h, of which
+about 1.4 h was idle while nobody drove the session).
+
+**Open:**
+- [ ] G1's GPU busy time (above).
+- [ ] Update the estimator for comm and trace runs.
+- [ ] The a-posteriori fit: memory efficiency and fixed per-step time from TP1 only, α and β from M2 and M3; TP2 as an out-of-sample prediction.

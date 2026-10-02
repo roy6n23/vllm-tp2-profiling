@@ -1,0 +1,18 @@
+type,run_id,config,kind,detail
+invalid,P1-serve_session-TP2-base-r1-eba6bf58,TP2,serve_session,"sub-5 (rate 37.56): failed=5 (must be 0); completed=3375 != num_prompts=3380; 5 requests have errors; first [2106]: Traceback (most recent call last):
+  File ""/usr/local/lib/python3.12/dist-packages/vllm/benchmarks/lib/endpoint_request_func.py"", line 204, in async_request_openai_completions
+    async with session.p; failed=5 (must be 0); completed=3375 != num_prompts=3380; 5 requests have errors; first [2106]: Traceback (most recent call last):
+  File ""/usr/local/lib/python3.12/dist-packages/vllm/benchmarks/lib/endpoint_request_func.py"", line 204, in async_request_openai_completions
+    async with session.p"
+invalid,P1-serve_session-DP2-base-r1-0963bb64,DP2,serve_session,"sub-5 (rate 41.59): failed=2 (must be 0); completed=3741 != num_prompts=3743; 2 requests have errors; first [2241]: Traceback (most recent call last):
+  File ""/usr/local/lib/python3.12/dist-packages/vllm/benchmarks/lib/endpoint_request_func.py"", line 204, in async_request_openai_completions
+    async with session.p; failed=2 (must be 0); completed=3741 != num_prompts=3743; 2 requests have errors; first [2241]: Traceback (most recent call last):
+  File ""/usr/local/lib/python3.12/dist-packages/vllm/benchmarks/lib/endpoint_request_func.py"", line 204, in async_request_openai_completions
+    async with session.p"
+invalid,P1-serve_session-TP1-base-r3-c40c4ab3,TP1,serve_session,"sub-5 (rate 18.98): failed=1 (must be 0); completed=1707 != num_prompts=1708; 1 requests have errors; first [668]: Traceback (most recent call last):
+  File ""/usr/lib/python3.12/asyncio/selector_events.py"", line 1013, in _read_ready__data_received
+    data = self._sock.recv(self.max_size)
+           ^^^^^^^^^^^^^^; failed=1 (must be 0); completed=1707 != num_prompts=1708; 1 requests have errors; first [668]: Traceback (most recent call last):
+  File ""/usr/lib/python3.12/asyncio/selector_events.py"", line 1013, in _read_ready__data_received
+    data = self._sock.recv(self.max_size)
+           ^^^^^^^^^^^^^^"

@@ -1,0 +1,83 @@
+run    P0-preflight-none-none-r0-4240e417
+PASS  gpu_count              2 GPU(s) visible (need exactly 2)
+PASS  gpu_name               GPU0: NVIDIA H100 80GB HBM3; GPU1: NVIDIA H100 80GB HBM3
+PASS  power_limit            GPU0: 700.00 W; GPU1: 700.00 W (need >= 700 W)
+PASS  driver                 driver 580.126.09 (need >= 580)
+PASS  topology               GPU0-GPU1 link NV18
+PASS  fabric                 GPU 00000000:3A:00.0: State Completed, Status Success; GPU 00000000:AB:00.0: State Completed, Status Success
+PASS  gpu_idle               memory.used GPU0: 4 MiB; GPU1: 4 MiB (need < 1024 MiB); no compute apps
+PASS  shm                    239372.3 MiB free at /dev/shm (need >= 1024 MiB)
+PASS  disk                   383773.0 GB free under /workspace/vllm-tp2-profiling/results (need >= 60 GB)
+PASS  nofile                 hard RLIMIT_NOFILE 524288 (need >= 8192)
+PASS  cpus                   208 CPUs usable (want >= 16)
+PASS  ram                    2164.1 GB RAM (want >= 128 GB)
+PASS  vllm_version           vllm --version: '0.30.0' (need 0.30.0)
+PASS  help_flags             33 argvs checked against --help=all; all flags known
+PASS  torch                  torch 2.13.0+cu130, cuda 13.0, SMs [132, 132], torch NCCL 2.29.7 (vLLM expects 2.30.7; recorded)
+PASS  vllm_env_names         16 VLLM_* names known
+PASS  json_configs           6 JSON values accepted
+PASS  nvcc                   nvcc at /usr/local/cuda/bin/nvcc
+PASS  flashinfer_jit_cache   flashinfer-jit-cache 0.6.18.post1+cu130 (need 0.6.18.post1)
+PASS  model_files            /workspace/models/llama31-8b-instruct: 4 shards, 16060556376 B, index total_size 16060522496
+WARN  model_volume           /workspace/models/llama31-8b-instruct is on a fuse file system
+      fix: The model is on a network volume: startup and page-cache warmup are slower. Copy it to local disk if startups time out.
+PASS  tokenizer_offline      TokenizersBackend, vocab 128256
+PASS  nsys                   /opt/nvidia/nsight-systems-cli/2026.5.1/target-linux-x64/nsys: NVIDIA Nsight Systems version 2026.5.1.161-265138896106v0
+PASS  nsys_status            NVIDIA Nsight Systems version 2026.5.1.161-265138896106v0
+PASS  monitor_field          clocks_event_reasons.active
+PASS  multicast              has_multicast_support: GPU0 True, GPU1 True
+PASS  nccl_allreduce         2-GPU NCCL all-reduce OK (default NCCL, NVLS allowed)
+PASS  imports                all imports work
+preflight OK: 28 checks, warnings: model_volume
+done   P0-preflight-none-none-r0-4240e417 (49.0 s)
+run    P0-envcapture-none-none-r0-4102a887
+done   P0-envcapture-none-none-r0-4102a887 (1.3 s)
+run    P0-smoke-TP1-base-r0-92920a15
+       sub-0 smoke rate 4.0 seed 0: valid [throttled]
+done   P0-smoke-TP1-base-r0-92920a15 (169.5 s)
+run    P0-smoke-TP2-base-r0-019687c7
+       sub-0 smoke rate 4.0 seed 0: valid [throttled]
+done   P0-smoke-TP2-base-r0-019687c7 (76.4 s)
+run    P0-smoke-DP2-base-r0-7bcd8c16
+       sub-0 smoke rate 4.0 seed 0: valid [throttled]
+done   P0-smoke-DP2-base-r0-7bcd8c16 (84.4 s)
+run    P0-comm_m2-none-none-r0-818ea63a
+done   P0-comm_m2-none-none-r0-818ea63a (18.0 s)
+run    P0-comm_m3-none-none-r0-9d62af24
+done   P0-comm_m3-none-none-r0-9d62af24 (13.6 s)
+run    P0-offline-TP1-base-r0-bcd79c36
+done   P0-offline-TP1-base-r0-bcd79c36 (537.4 s)
+run    P0-offline-TP2-base-r0-049f226b
+done   P0-offline-TP2-base-r0-049f226b (356.9 s)
+run    P0-offline-TP2-AR3-r0-85364df9
+done   P0-offline-TP2-AR3-r0-85364df9 (134.5 s)
+run    P0-offline-TP1-G2-r0-330b46b7
+done   P0-offline-TP1-G2-r0-330b46b7 (92.6 s)
+run    P0-offline-TP2-G2-r0-e9e04f74
+done   P0-offline-TP2-G2-r0-e9e04f74 (112.7 s)
+run    P0-bench_latency_xcheck-TP1-base-r0-e1bd7e77
+done   P0-bench_latency_xcheck-TP1-base-r0-e1bd7e77 (64.2 s)
+run    P0-bench_latency_xcheck-TP2-base-r0-c90f2110
+done   P0-bench_latency_xcheck-TP2-base-r0-c90f2110 (62.6 s)
+run    P0-trace-TP1-base-r0-2d7e12bf
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P0-trace-TP1-base-r0-2d7e12bf (89.6 s)
+run    P0-trace-TP1-base-r0-d0affa81
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P0-trace-TP1-base-r0-d0affa81 (97.5 s)
+run    P0-trace-TP1-base-r0-5b8c95bd
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P0-trace-TP1-base-r0-5b8c95bd (75.1 s)
+run    P0-trace-TP2-base-r0-bbf7d5bb
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P0-trace-TP2-base-r0-bbf7d5bb (109.1 s)
+run    P0-trace-TP2-base-r0-d2ca73df
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P0-trace-TP2-base-r0-d2ca73df (112.0 s)
+run    P0-trace-TP2-base-r0-b04c881e
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P0-trace-TP2-base-r0-b04c881e (89.2 s)
+run    P0-trace-TP2-G2-r0-a145952f
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P0-trace-TP2-G2-r0-a145952f (114.4 s)
+21 done, 0 failed, 0 skipped (/workspace/vllm-tp2-profiling/results/raw/_last_run.json)

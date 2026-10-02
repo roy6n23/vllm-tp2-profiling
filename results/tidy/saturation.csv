@@ -1,0 +1,25 @@
+row,run_id,sub,tier,phase,config,arm,round,seed,valid,completed,mu_tps,mu_rps,preemptions,preempt_per_1k,flags,n_seeds,grid_mu_rps
+seed,P1-serve_session-TP1-base-r0-297826c7,0,P1,sat,TP1,base,0,1,True,3000,5114.945957767751,19.980257647530276,419.0,139.66666666666666,preempted; throttled; throttled,,
+seed,P1-serve_session-TP1-base-r0-297826c7,1,P1,sat,TP1,base,0,2,True,3000,5126.7659627721,20.026429542078514,404.0,134.66666666666666,preempted; throttled; throttled,,
+seed,P1-serve_session-TP1-base-r0-297826c7,2,P1,sat,TP1,base,0,3,True,3000,5088.174013384445,19.87567973978299,420.0,140.0,preempted; throttled; throttled,,
+seed,P1-serve_session-TP2-base-r0-d52c5a40,0,P1,sat,TP2,base,0,1,True,3000,10133.753379527923,39.58497413878095,242.0,80.66666666666666,preempted; throttled; throttled; cpu>80%,,
+seed,P1-serve_session-TP2-base-r0-d52c5a40,1,P1,sat,TP2,base,0,2,True,3000,10122.404818930847,39.54064382394862,244.0,81.33333333333333,preempted; throttled; throttled; cpu>80%,,
+seed,P1-serve_session-TP2-base-r0-d52c5a40,2,P1,sat,TP2,base,0,3,True,3000,10122.385757339014,39.540569364605524,244.0,81.33333333333333,preempted; throttled; throttled; cpu>80%,,
+seed,P1-serve_session-DP2-base-r0-3ecb2c9a,0,P1,sat,DP2,base,0,1,True,3000,11249.294741912803,43.94255758559689,376.0,125.33333333333333,preempted; throttled; throttled; cpu>80%,,
+seed,P1-serve_session-DP2-base-r0-3ecb2c9a,1,P1,sat,DP2,base,0,2,True,3000,11206.126597173783,43.77393202021009,372.0,124.0,preempted; throttled; throttled; cpu>80%,,
+seed,P1-serve_session-DP2-base-r0-3ecb2c9a,2,P1,sat,DP2,base,0,3,True,3000,11197.93929819509,43.74195038357457,374.0,124.66666666666666,preempted; throttled; throttled; cpu>80%,,
+seed,P2-serve_session-TP2-base-r0-e193f2ee,3,P2,pc,TP2,base,0,1,True,3000,10118.522969007767,39.52548034768659,244.0,81.33333333333333,preempted; throttled; throttled; cpu>80%,,
+seed,P2-serve_session-TP2-PCon-r0-85c5ebab,3,P2,pc,TP2,PCon,0,1,True,3000,16852.264130732885,65.82915676067533,0.0,0.0,throttled; throttled; cpu>80%,,
+seed,P2-serve_session-TP2-API2-r0-aa946cec,0,P2,sat,TP2,API2,0,1,True,3000,10112.391632145655,39.50152981306896,245.0,81.66666666666667,no_gauges; preempted; throttled; throttled,,
+seed,P2-serve_session-TP2-API2-r0-aa946cec,1,P2,sat,TP2,API2,0,2,True,3000,10112.649672774915,39.50253778427701,242.0,80.66666666666666,no_gauges; preempted; throttled; throttled,,
+seed,P2-serve_session-TP2-API2-r0-aa946cec,2,P2,sat,TP2,API2,0,3,True,3000,10127.215644945583,39.559436113068685,242.0,80.66666666666666,no_gauges; preempted; throttled; throttled,,
+seed,P2-serve_session-DP2-API2-r0-cf3d006c,0,P2,sat,DP2,API2,0,1,True,3000,11180.972721347633,43.67567469276419,370.0,123.33333333333334,no_gauges; preempted; throttled; throttled; cpu>80%,,
+seed,P2-serve_session-DP2-API2-r0-cf3d006c,1,P2,sat,DP2,API2,0,2,True,3000,11198.489409290856,43.74409925504241,373.0,124.33333333333334,no_gauges; preempted; throttled; throttled,,
+seed,P2-serve_session-DP2-API2-r0-cf3d006c,2,P2,sat,DP2,API2,0,3,True,3000,11203.30234795515,43.762899796699806,359.0,119.66666666666667,no_gauges; preempted; throttled; throttled,,
+median,,,,sat,DP2,API2,,,,,11198.489409290856,43.74409925504241,,123.33333333333334,,3,
+median,,,,sat,DP2,base,,,,,11206.126597173783,43.77393202021009,,124.66666666666666,,3,43.77393202021009
+median,,,,sat,TP1,base,,,,,5114.945957767751,19.980257647530276,,139.66666666666666,,3,19.980257647530276
+median,,,,sat,TP2,API2,,,,,10112.649672774915,39.50253778427701,,80.66666666666666,,3,
+median,,,,pc,TP2,PCon,,,,,16852.264130732885,65.82915676067533,,0.0,,1,
+median,,,,pc,TP2,base,,,,,10118.522969007767,39.52548034768659,,81.33333333333333,,1,
+median,,,,sat,TP2,base,,,,,10122.404818930847,39.54064382394862,,81.33333333333333,,3,39.54064382394862

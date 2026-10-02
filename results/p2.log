@@ -1,0 +1,115 @@
+run    P2-offline-TP2-AR1-r0-fa307693
+done   P2-offline-TP2-AR1-r0-fa307693 (223.7 s)
+run    P2-offline-TP2-AR2-r0-0abf89c1
+done   P2-offline-TP2-AR2-r0-0abf89c1 (224.3 s)
+run    P2-offline-TP2-AR3-r0-4cf41dde
+done   P2-offline-TP2-AR3-r0-4cf41dde (151.6 s)
+run    P2-offline-TP1-G1-r0-67cfa116
+done   P2-offline-TP1-G1-r0-67cfa116 (164.6 s)
+run    P2-offline-TP2-G1-r0-cdaaec89
+done   P2-offline-TP2-G1-r0-cdaaec89 (184.6 s)
+run    P2-offline-TP1-G2-r0-980ac590
+done   P2-offline-TP1-G2-r0-980ac590 (109.9 s)
+run    P2-offline-TP2-G2-r0-a36325cb
+done   P2-offline-TP2-G2-r0-a36325cb (122.5 s)
+run    P2-offline-TP1-EXECuni-r0-88785db8
+done   P2-offline-TP1-EXECuni-r0-88785db8 (147.8 s)
+run    P2-offline-TP2-FIBtrtllm-r0-38ff59f0
+done   P2-offline-TP2-FIBtrtllm-r0-38ff59f0 (217.4 s)
+run    P2-trace-TP2-AR1-r0-d50c54a9
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P2-trace-TP2-AR1-r0-d50c54a9 (97.6 s)
+run    P2-trace-TP2-AR2-r0-503e794d
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P2-trace-TP2-AR2-r0-503e794d (98.7 s)
+run    P2-trace-TP2-AR3-r0-6a72aec8
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P2-trace-TP2-AR3-r0-6a72aec8 (109.3 s)
+run    P2-trace-TP1-G1-r0-075888da
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P2-trace-TP1-G1-r0-075888da (84.5 s)
+run    P2-trace-TP2-G1-r0-faa4b0ea
+       attempt 1 (capture-range=cudaProfilerApi): completeness gate ok
+done   P2-trace-TP2-G1-r0-faa4b0ea (100.2 s)
+run    P2-serve_session-TP2-base-r0-e193f2ee
+       sub-0 pc rate 23.72 seed 1000: valid [throttled]
+       sub-1 pc rate 23.72 seed 2000: valid [throttled]
+       sub-2 pc rate 23.72 seed 3000: valid [throttled]
+       sub-3 pc rate inf seed 1: valid [preempted, throttled]
+done   P2-serve_session-TP2-base-r0-e193f2ee (513.5 s)
+run    P2-serve_session-TP2-PCon-r0-85c5ebab
+       sub-0 pc rate 23.72 seed 1000: valid [throttled]
+       sub-1 pc rate 23.72 seed 2000: valid [throttled]
+       sub-2 pc rate 23.72 seed 3000: valid [throttled]
+       sub-3 pc rate inf seed 1: valid [throttled]
+done   P2-serve_session-TP2-PCon-r0-85c5ebab (468.1 s)
+run    P2-serve_session-DP2rand-base-r1-d5ef9c66
+       sub-0 sweep rate 8.75 seed 1000: valid [throttled, start_skew]
+       sub-1 sweep rate 17.51 seed 1001: valid [throttled]
+       sub-2 sweep rate 26.26 seed 1002: valid [throttled]
+       sub-3 sweep rate 32.83 seed 1003: valid [throttled]
+       sub-4 sweep rate 37.21 seed 1004: valid [throttled]
+       sub-5 sweep rate 41.59 seed 1005: valid [throttled]
+done   P2-serve_session-DP2rand-base-r1-d5ef9c66 (769.3 s)
+run    P2-serve_session-TP2-API2-r0-aa946cec
+failed P2-serve_session-TP2-API2-r0-aa946cec: RuntimeError: MetricsPoller for /workspace/vllm-tp2-profiling/results/raw/P2-serve_session-TP2-API2-r0-aa946cec/sub-0/gauges.csv failed: metric vllm:num_requests_running not found in the scrape
+run    P2-serve_session-DP2-API2-r0-cf3d006c
+failed P2-serve_session-DP2-API2-r0-cf3d006c: RuntimeError: MetricsPoller for /workspace/vllm-tp2-profiling/results/raw/P2-serve_session-DP2-API2-r0-cf3d006c/sub-0/gauges.csv failed: metric vllm:num_requests_running not found in the scrape
+run    P2-comm_m1-none-none-r0-23f1f424
+done   P2-comm_m1-none-none-r0-23f1f424 (29.4 s)
+run    P2-comm_m3-none-none-r0-d6e13031
+done   P2-comm_m3-none-none-r0-d6e13031 (18.1 s)
+run    P2-comm_m3-none-none-r0-f8c7571a
+done   P2-comm_m3-none-none-r0-f8c7571a (15.1 s)
+run    P2-comm_m3-none-none-r0-33cc249b
+done   P2-comm_m3-none-none-r0-33cc249b (14.4 s)
+run    P2-comm_m3-none-none-r0-b75af1f7
+done   P2-comm_m3-none-none-r0-b75af1f7 (18.8 s)
+run    P2-comm_m3-none-none-r0-878505b3
+done   P2-comm_m3-none-none-r0-878505b3 (15.5 s)
+run    P2-comm_m3-none-none-r0-daaddc30
+done   P2-comm_m3-none-none-r0-daaddc30 (14.8 s)
+run    P2-comm_m3-none-none-r0-e178f7ba
+done   P2-comm_m3-none-none-r0-e178f7ba (15.8 s)
+run    P2-comm_m4-none-none-r0-2103a2dc
+done   P2-comm_m4-none-none-r0-2103a2dc (23.0 s)
+26 done, 2 failed, 0 skipped (/workspace/vllm-tp2-profiling/results/raw/_last_run.json)
+  failed  P2-serve_session-TP2-API2-r0-aa946cec
+  failed  P2-serve_session-DP2-API2-r0-cf3d006c
+skip   P2-offline-TP2-AR1-r0-fa307693: already_done
+skip   P2-offline-TP2-AR2-r0-0abf89c1: already_done
+skip   P2-offline-TP2-AR3-r0-4cf41dde: already_done
+skip   P2-offline-TP1-G1-r0-67cfa116: already_done
+skip   P2-offline-TP2-G1-r0-cdaaec89: already_done
+skip   P2-offline-TP1-G2-r0-980ac590: already_done
+skip   P2-offline-TP2-G2-r0-a36325cb: already_done
+skip   P2-offline-TP1-EXECuni-r0-88785db8: already_done
+skip   P2-offline-TP2-FIBtrtllm-r0-38ff59f0: already_done
+skip   P2-trace-TP2-AR1-r0-d50c54a9: already_done
+skip   P2-trace-TP2-AR2-r0-503e794d: already_done
+skip   P2-trace-TP2-AR3-r0-6a72aec8: already_done
+skip   P2-trace-TP1-G1-r0-075888da: already_done
+skip   P2-trace-TP2-G1-r0-faa4b0ea: already_done
+skip   P2-serve_session-TP2-base-r0-e193f2ee: already_done
+skip   P2-serve_session-TP2-PCon-r0-85c5ebab: already_done
+skip   P2-serve_session-DP2rand-base-r1-d5ef9c66: already_done
+run    P2-serve_session-TP2-API2-r0-aa946cec
+       sub-0 sat rate inf seed 1: valid [no_gauges, preempted, throttled]
+       sub-1 sat rate inf seed 2: valid [no_gauges, preempted, throttled]
+       sub-2 sat rate inf seed 3: valid [no_gauges, preempted, throttled]
+done   P2-serve_session-TP2-API2-r0-aa946cec (415.3 s)
+run    P2-serve_session-DP2-API2-r0-cf3d006c
+       sub-0 sat rate inf seed 1: valid [no_gauges, preempted, throttled]
+       sub-1 sat rate inf seed 2: valid [no_gauges, preempted, throttled]
+       sub-2 sat rate inf seed 3: valid [no_gauges, preempted, throttled]
+done   P2-serve_session-DP2-API2-r0-cf3d006c (361.7 s)
+skip   P2-comm_m1-none-none-r0-23f1f424: already_done
+skip   P2-comm_m3-none-none-r0-d6e13031: already_done
+skip   P2-comm_m3-none-none-r0-f8c7571a: already_done
+skip   P2-comm_m3-none-none-r0-33cc249b: already_done
+skip   P2-comm_m3-none-none-r0-b75af1f7: already_done
+skip   P2-comm_m3-none-none-r0-878505b3: already_done
+skip   P2-comm_m3-none-none-r0-daaddc30: already_done
+skip   P2-comm_m3-none-none-r0-e178f7ba: already_done
+skip   P2-comm_m4-none-none-r0-2103a2dc: already_done
+2 done, 0 failed, 26 skipped (/workspace/vllm-tp2-profiling/results/raw/_last_run.json)
