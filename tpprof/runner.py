@@ -1120,9 +1120,11 @@ class Runner:
             raise RunFailure("metrics_unreachable", f"GET /metrics failed before sub-{k} on a live server")
         with open(os.path.join(sub_dir, "metrics_before.prom"), "w") as f:
             f.write(before_text)
-        # spec 4.4: the gauges are sampled once per second during saturation (rate inf) runs
+        # spec 4.4: the gauges are sampled once per second during saturation (rate inf) runs, when the
+        # server exposes them (not with two API servers, see EngineConfig.exposes_gauges)
+        gauges = all(cfg.exposes_gauges for cfg in self._engine_configs(spec))
         poller = (server.MetricsPoller([h.base_url for h in handles], os.path.join(sub_dir, "gauges.csv"))
-                  if math.isinf(sub.rate) else contextlib.nullcontext())
+                  if math.isinf(sub.rate) and gauges else contextlib.nullcontext())
         with poller:
             outcomes = client.run_clients(specs, self.env, sub_dir, spec.run_id, timeout_s, self.ctx.vllm_bin)
         if len(outcomes) == 1 and os.path.exists(outcomes[0].log_path):
@@ -1147,7 +1149,7 @@ class Runner:
                 f.write(after_text)
 
         violations: list[str] = []
-        flags: list[str] = []
+        flags: list[str] = [] if gauges else ["no_gauges"]
         for o in outcomes:
             if o.exit_code != 0:
                 violations.append(f"client exited {o.exit_code}; see {os.path.basename(o.log_path)}")
@@ -1160,10 +1162,10 @@ class Runner:
             violations.append(f"result: {e}")
         preemptions = None
         try:
-            before = promparse.scrape_summary(before_text)
+            before = promparse.scrape_summary(before_text, gauges=gauges)
             if after_text is None:
                 raise ValueError("no /metrics scrape after the run (server gone?)")
-            delta = promparse.deltas(before, promparse.scrape_summary(after_text))
+            delta = promparse.deltas(before, promparse.scrape_summary(after_text, gauges=gauges))
             preemptions = delta["vllm:num_preemptions_total"]
             if preemptions > 0:
                 flags.append("preempted")

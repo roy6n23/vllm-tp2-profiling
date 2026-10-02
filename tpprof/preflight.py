@@ -646,8 +646,12 @@ if __name__ == "__main__":
 
 def _nccl_reason(out: str, err: str) -> str:
     lines = [line.strip() for line in (err + "\n" + out).splitlines() if line.strip()]
-    warns = [line for line in lines if "NCCL WARN" in line or "Last error" in line]
-    return (warns or lines or ["no output"])[0][-300:]
+    for i, line in enumerate(lines):
+        if "NCCL WARN" in line:
+            return line[-300:]
+        if line.startswith("Last error"):   # the cause follows on the next line
+            return " ".join(lines[i:i + 2])[-300:]
+    return (lines or ["no output"])[0][-300:]
 
 
 def _nccl_allreduce(ctx: PreflightContext) -> Check:

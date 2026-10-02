@@ -112,6 +112,17 @@ def test_scrape_summary_raises_listing_every_missing_metric():
         assert name in str(err.value)
 
 
+def test_scrape_summary_without_gauges_for_multi_api_server_runs():
+    # vLLM 0.30.0 drops the gauges when --api-server-count > 1 (2026-10-02 box); the counters stay
+    text = "\n".join(ln for ln in SCRAPE.splitlines() if not any(g in ln for g in GAUGES))
+    summary = scrape_summary(text, gauges=False)
+    assert set(summary) == set(TRACKED)
+    with pytest.raises(ValueError):
+        scrape_summary(text)
+    with pytest.raises(ValueError):            # the counters are still required
+        scrape_summary(text.replace("vllm:request_success_total", "vllm:x"), gauges=False)
+
+
 def test_deltas():
     before = scrape_summary(SCRAPE)
     after_text = (SCRAPE.replace('finished_reason="length",model_name="llama-3.1-8b-instruct"} 99.0',

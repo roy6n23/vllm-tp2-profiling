@@ -120,6 +120,12 @@ class EngineConfig:
     unset_env: tuple[str, ...]
     api_servers: int = 1
 
+    @property
+    def exposes_gauges(self) -> bool:
+        """vLLM 0.30.0 disables stats logging, and with it the /metrics gauges, when --api-server-count > 1
+        ("AsyncLLM created with api_server_count more than 1; disabling stats logging", 2026-10-02 box)."""
+        return self.api_servers == 1
+
     def engine_args(self) -> list[str]:
         args: list[str] = []
         for flag, value in self.flags:

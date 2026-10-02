@@ -178,6 +178,12 @@ def test_execuni_and_fibtrtllm():
     assert fib.engine_args() == e.base_config("TP2").engine_args()
 
 
+def test_only_single_api_server_configs_expose_gauges():
+    assert e.base_config("TP2").exposes_gauges
+    assert not e.arm_config("TP2", "API2").exposes_gauges
+    assert not e.arm_config("DP2", "API2").exposes_gauges
+
+
 def test_api2_only_changes_serve_count():
     base, api2 = e.base_config("DP2"), e.arm_config("DP2", "API2")
     assert base.engine_args() == api2.engine_args()

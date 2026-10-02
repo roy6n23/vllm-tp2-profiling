@@ -563,12 +563,12 @@ def _throttled(sub_dir: str, session_dir: str) -> tuple[bool | None, str | None]
     return None, None
 
 
-def _metric_deltas(sub_dir: str) -> tuple[dict[str, float] | None, str | None]:
+def _metric_deltas(sub_dir: str, gauges: bool = True) -> tuple[dict[str, float] | None, str | None]:
     try:
         with open(os.path.join(sub_dir, "metrics_before.prom")) as f:
-            before = promparse.scrape_summary(f.read())
+            before = promparse.scrape_summary(f.read(), gauges=gauges)
         with open(os.path.join(sub_dir, "metrics_after.prom")) as f:
-            after = promparse.scrape_summary(f.read())
+            after = promparse.scrape_summary(f.read(), gauges=gauges)
         return promparse.deltas(before, after), None
     except _PARSE_ERRORS as e:
         return None, f"metrics: {e}"
@@ -605,7 +605,8 @@ def _sub_row(run: Run, k: int, sub: str) -> tuple[dict, results.ServeResult, lis
              "arm": meta.get("arm", run.arm), "round": int(meta.get("round", run.round)),
              "rate_target": rate if rate is not None else r.request_rate}
     row = results.online_row(r, extra)
-    deltas, metrics_note = _metric_deltas(sub)
+    # the runner records no_gauges for a server that exposes none (two API servers)
+    deltas, metrics_note = _metric_deltas(sub, gauges="no_gauges" not in validation.get("flags", []))
     cpu, cpu_scope, cpu_note, errors = _cpu_for(sub, run.path, k)
     throttled, gpu_error = _throttled(sub, run.path)
     if gpu_error:

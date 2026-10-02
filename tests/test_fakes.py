@@ -302,6 +302,15 @@ def test_serve_prefix_cache_counters_follow_the_flag(tmp_path, pc_flag, queries,
     assert metric_value(metrics, "vllm:prompt_tokens_total", **labels) == 2 * 1024
 
 
+def test_serve_with_two_api_servers_drops_the_gauges_like_vllm(tmp_path):
+    # vLLM 0.30.0: "AsyncLLM created with api_server_count more than 1; disabling stats logging"
+    # (2026-10-02 box); the counters stay
+    with fake_server(tmp_path, ["--api-server-count", "2"], fake_env(tmp_path)) as (_proc, port, _log):
+        metrics = http_body(port, "/metrics")
+    assert "vllm:num_requests_running" not in metrics and "vllm:kv_cache_usage_perc" not in metrics
+    assert "vllm:request_success_total" in metrics
+
+
 def test_serve_rejects_unknown_model_like_the_real_server(tmp_path):
     with fake_server(tmp_path, ["--served-model-name", SERVED], fake_env(tmp_path)) as (_proc, port, _log):
         assert http_status(port, "POST", "/v1/completions", completion_body(2, model="other")) == 404

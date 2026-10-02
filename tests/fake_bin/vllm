@@ -387,12 +387,15 @@ class ServeState:
         with self.lock:
             engines = [(str(i), e) for i, e in enumerate(self.engines)]
             base = [{"engine": i, "model_name": model} for i, _ in engines]
-            family("vllm:num_requests_running", "gauge", "Number of requests in model execution batches.",
-                   [(b, e.running) for b, (_, e) in zip(base, engines)])
-            family("vllm:num_requests_waiting", "gauge", "Number of requests waiting to be processed.",
-                   [(b, 0) for b in base])
-            family("vllm:kv_cache_usage_perc", "gauge", "KV-cache usage. 1 means 100 percent usage.",
-                   [(b, e.kv_used / self.cfg.kv_tokens) for b, (_, e) in zip(base, engines)])
+            # vLLM 0.30.0 with --api-server-count > 1 disables stats logging, and the gauges go with it
+            # (2026-10-02 box: "AsyncLLM created with api_server_count more than 1; disabling stats logging")
+            if self.cfg.api_servers == 1:
+                family("vllm:num_requests_running", "gauge", "Number of requests in model execution batches.",
+                       [(b, e.running) for b, (_, e) in zip(base, engines)])
+                family("vllm:num_requests_waiting", "gauge", "Number of requests waiting to be processed.",
+                       [(b, 0) for b in base])
+                family("vllm:kv_cache_usage_perc", "gauge", "KV-cache usage. 1 means 100 percent usage.",
+                       [(b, e.kv_used / self.cfg.kv_tokens) for b, (_, e) in zip(base, engines)])
             counters = [
                 ("vllm:num_preemptions", "Cumulative number of preemption from the engine.", lambda e: 0),
                 ("vllm:prefix_cache_queries", "Prefix cache queries, in terms of number of queried tokens.",

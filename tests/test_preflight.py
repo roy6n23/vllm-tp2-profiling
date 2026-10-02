@@ -304,6 +304,15 @@ def test_nccl_allreduce_names_a_broken_nvls_host(tmp_path, monkeypatch):
     assert "terminate" in check.fix
 
 
+def test_nccl_allreduce_reason_without_nccl_debug(tmp_path, monkeypatch):
+    # without NCCL_DEBUG, torch prints "Last error:" and the cause on the next line (2026-10-02 box)
+    err = ("ncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to bind NVLink SHARP "
+           "(NVLS) Multicast memory of size 2097152 : CUDA error 401 'the operation cannot be performed'.\n")
+    _fake_probe(monkeypatch, (1, "", err), (0, "rank 0 NCCL_AR_OK\nrank 1 NCCL_AR_OK\n", ""))
+    check = preflight._nccl_allreduce(_ctx(tmp_path, on_box=True))
+    assert "CUDA error 401" in check.detail
+
+
 def test_nccl_allreduce_fails_without_nvls_too(tmp_path, monkeypatch):
     _fake_probe(monkeypatch, (1, "", "NCCL WARN something else\n"), (1, "", "NCCL WARN something else\n"))
     check = preflight._nccl_allreduce(_ctx(tmp_path, on_box=True))

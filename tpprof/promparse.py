@@ -57,14 +57,16 @@ def metric_sum(samples, name: str) -> float:
     return sum(values)
 
 
-def scrape_summary(text: str) -> dict[str, float]:
-    """TRACKED counters and GAUGES, each summed over label sets -> {name: value}."""
+def scrape_summary(text: str, gauges: bool = True) -> dict[str, float]:
+    """TRACKED counters and (unless gauges=False, for a server that exposes none) GAUGES, each summed over
+    label sets -> {name: value}."""
+    names = (*TRACKED, *GAUGES) if gauges else TRACKED
     samples = parse_prometheus(text)
     present = {n for n, _, _ in samples}
-    missing = [n for n in (*TRACKED, *GAUGES) if n not in present]
+    missing = [n for n in names if n not in present]
     if missing:
         raise ValueError(f"metrics missing from the scrape: {', '.join(missing)}")
-    return {n: metric_sum(samples, n) for n in (*TRACKED, *GAUGES)}
+    return {n: metric_sum(samples, n) for n in names}
 
 
 def deltas(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:

@@ -285,6 +285,10 @@ def test_p2_sessions_without_grid_are_skipped(tmp_path):
     dp2 = [s.run_id for s in api2 if s.config == "DP2"]
     assert summary["failed"] == tp2 and summary["done"] == dp2
     assert read(os.path.join(str(res), "raw", tp2[0], "failed.json"))["reason"] == "server_start_failed"
+    # two API servers expose no gauges (vLLM 0.30.0): the run stands on its counters and says so
+    validation = read(os.path.join(str(res), "raw", dp2[0], "sub-0", "validation.json"))
+    assert validation["valid"] and "no_gauges" in validation["flags"]
+    assert not os.path.exists(os.path.join(str(res), "raw", dp2[0], "sub-0", "gauges.csv"))
     assert leftover_fakes(res) == []
 
 
