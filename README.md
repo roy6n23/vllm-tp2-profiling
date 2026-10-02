@@ -90,11 +90,14 @@ but it also roughly 2.6× the GPU work per step.
 
 **Data.** [results/SUMMARY.md](results/SUMMARY.md) has every table and the
 figures; `results/tidy/*.csv` are the tidy tables. The `raw/` run records
-(436 MB, zstd) and the Nsight Systems traces (252 MB) are release assets. To
-regenerate the report from them:
+(436 MB, zstd) and the Nsight Systems traces (252 MB) are release assets, split
+into 100 MB parts. To regenerate the report from them:
 
 ```bash
 gh release download results-2026-10-02 -R roy6n23/vllm-tp2-profiling
+cat results-2026-10-02-raw.tar.zst.part-* > results-2026-10-02-raw.tar.zst
+cat results-2026-10-02-traces.tar.part-* > results-2026-10-02-traces.tar
+shasum -a 256 -c SHA256SUMS
 tar --zstd -xf results-2026-10-02-raw.tar.zst -C results/ && tar -xf results-2026-10-02-traces.tar -C results/
 find results/raw -name 'trace.sqlite.zst' -exec zstd -q -d {} \;
 python -m tpprof report
