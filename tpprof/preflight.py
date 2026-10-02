@@ -17,6 +17,8 @@ import re
 import resource
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -83,6 +85,8 @@ FIXES: dict[str, str] = {
     "multicast": "No NVSwitch multicast: recorded as a run attribute (FlashInfer falls back from mnnvl to "
                  "trtllm; NVLS is unavailable). No action needed.",
     "imports": "Install tpprof into the image Python: `pip install --no-deps -e .` from the repo root.",
+    "nccl_allreduce": "Every TP2 run needs this all-reduce. If the detail names NVLS, the host's NVSwitch "
+                      "multicast is broken (fabric manager): " + _TERMINATE,
 }
 
 
@@ -489,7 +493,8 @@ def _flashinfer_jit_cache() -> Check:
         got = importlib.metadata.version(dist)
     except importlib.metadata.PackageNotFoundError:
         return _check("flashinfer_jit_cache", False, f"{dist} is not installed (need {want})")
-    return _check("flashinfer_jit_cache", got == want, f"{dist} {got} (need {want})")
+    # compare the public release only: the pinned image's wheel carries a local label (+cu130)
+    return _check("flashinfer_jit_cache", got.split("+", 1)[0] == want, f"{dist} {got} (need {want})")
 
 
 def check_model_files(model_dir: str) -> Check:
@@ -615,6 +620,57 @@ def _multicast() -> Check:
                   ", ".join(f"GPU{i} {r}" for i, r in enumerate(results)))
 
 
+NCCL_TIMEOUT_S = 180
+NCCL_OK = "NCCL_AR_OK"
+# One all-reduce over both GPUs with the NCCL setup vLLM gets. `multicast` only reads the attribute;
+# on the 2026-10-01 box it said True while binding multicast memory failed (CUDA error 401), so every
+# TP2 engine died in ncclCommInitRank.
+NCCL_PROBE = f"""
+import socket, torch, torch.distributed as dist, torch.multiprocessing as mp
+
+def work(rank, port):
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{{port}}", rank=rank, world_size=2)
+    x = torch.ones(1 << 20, device="cuda")
+    dist.all_reduce(x)
+    torch.cuda.synchronize()
+    assert x[0].item() == 2.0, x[0].item()
+    print("rank", rank, "{NCCL_OK}", flush=True)
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    mp.spawn(work, args=(port,), nprocs=2)
+"""
+
+
+def _nccl_reason(out: str, err: str) -> str:
+    lines = [line.strip() for line in (err + "\n" + out).splitlines() if line.strip()]
+    warns = [line for line in lines if "NCCL WARN" in line or "Last error" in line]
+    return (warns or lines or ["no output"])[0][-300:]
+
+
+def _nccl_allreduce(ctx: PreflightContext) -> Check:
+    env = environ(ctx)
+    env.pop("NCCL_NVLS_ENABLE", None)
+    # a script file, not `python -c`: mp.spawn children re-import __main__ to find `work`
+    with tempfile.TemporaryDirectory() as tmp:
+        script = os.path.join(tmp, "nccl_probe.py")
+        with open(script, "w") as f:
+            f.write(NCCL_PROBE)
+        argv = [sys.executable, script]
+        code, out, err = run_text(argv, env, NCCL_TIMEOUT_S)
+        if code == 0 and out.count(NCCL_OK) == 2:
+            return _check("nccl_allreduce", True, "2-GPU NCCL all-reduce OK (default NCCL, NVLS allowed)")
+        reason = _nccl_reason(out, err)
+        code2, out2, _ = run_text(argv, {**env, "NCCL_NVLS_ENABLE": "0"}, NCCL_TIMEOUT_S)
+    if code2 == 0 and out2.count(NCCL_OK) == 2:
+        return _check("nccl_allreduce", False, f"fails with NVLS, works with NCCL_NVLS_ENABLE=0: NVLS is broken "
+                                               f"on this host: {reason}")
+    return _check("nccl_allreduce", False, f"2-GPU NCCL all-reduce fails ({reason}); "
+                                           "also fails with NCCL_NVLS_ENABLE=0")
+
+
 def _imports(ctx: PreflightContext) -> Check:
     errors = []
     for name in BASE_IMPORTS + (BOX_IMPORTS if ctx.on_box else ()):
@@ -643,6 +699,7 @@ def full_checks(ctx: PreflightContext) -> list[Check]:
         ("nsys_status", _nsys_status, (ctx,), True),
         ("monitor_field", _monitor_field, (ctx,), True),
         ("multicast", _multicast, (), box),
+        ("nccl_allreduce", _nccl_allreduce, (ctx,), box),
         ("imports", _imports, (ctx,), True),
     ]
     full = [_guarded(name, fn, *args) for name, fn, args, run in plan if run]

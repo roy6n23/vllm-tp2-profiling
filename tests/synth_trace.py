@@ -210,6 +210,12 @@ def _layout(w: _Writer, ri: int, rank: dict, collide: bool) -> tuple[int, int]:
         gpu = max(gpu, start + dur)
 
     for k, (nc, nct, ng, ngt) in enumerate(rank["steps"][:n_keep]):
+        if nc == 0 and ng == 0:
+            # an empty scheduler step: vLLM still opens the execute range but launches nothing
+            w.add("NVTX_EVENTS", (cpu, cpu + RANGE_NS, 59, None, None, None,
+                                  "execute_context_0(0)_generation_0(0)", gtid, None, None, 0))
+            cpu += RANGE_NS + IDLE_GAP_NS
+            continue
         step_ks = ks[n_first_ar:] if k in short else ks
         step_split = split - n_first_ar if k in short else split
         lag = _lag(k, period)

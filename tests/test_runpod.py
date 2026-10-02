@@ -114,6 +114,18 @@ def test_create_posts_exactly_the_brief_body(runpod, mock_api, pubkey, capsys):
     assert mock_api.of("GET") == [] and mock_api.of("DELETE") == []
 
 
+def test_requests_identify_the_client(runpod, mock_api, pubkey):
+    # rest.runpod.io's Cloudflare rejects urllib's default "Python-urllib/3.x" with 403 error 1010
+    # (2026-10-01); every call names this client instead
+    runpod.main(["create", "--pubkey", str(pubkey)])
+    runpod.main(["terminate", "pod123"])
+    reqs = mock_api.of("POST") + mock_api.of("DELETE")
+    assert len(reqs) == 2
+    for req in reqs:
+        ua = req["headers"]["user-agent"]
+        assert ua.startswith("tpprof-runpod/") and "Python-urllib" not in ua
+
+
 def test_create_options_change_only_their_fields(runpod, mock_api, pubkey):
     rc = runpod.main(["create", "--pubkey", str(pubkey), "--gpus", "1", "--name", "p1",
                       "--volume-gb", "50", "--disk-gb", "40"])
@@ -286,6 +298,19 @@ def test_sync_to_box_also_copies_triton_fa2_forward_when_present(tmp_path):
     argv = calls[1]["argv"]
     assert "ssh -p 10341" in argv
     assert argv[-2:] == [f"{fa2}/", "root@203.0.113.7:/workspace/triton-fa2-forward/"]
+
+
+def test_sync_to_box_takes_triton_fa2_forward_from_env(tmp_path):
+    env, _home, log = _fake_rsync_env(tmp_path)
+    fa2 = tmp_path / "elsewhere" / "triton-fa2-forward"
+    fa2.mkdir(parents=True)
+    env["TPPROF_FA2_DIR"] = str(fa2)
+    proc = subprocess.run(["bash", str(SCRIPTS / "sync_to_box.sh"), "203.0.113.7", "10341"],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    calls = _rsync_calls(log)
+    assert len(calls) == 2
+    assert calls[1]["argv"][-2:] == [f"{fa2}/", "root@203.0.113.7:/workspace/triton-fa2-forward/"]
 
 
 def test_sync_to_box_usage_error_without_args(tmp_path):

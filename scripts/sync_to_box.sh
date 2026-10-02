@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 rsync -az --delete --exclude .venv --exclude results/dryrun -e "ssh -p $PORT" ./ "root@$HOST:/workspace/vllm-tp2-profiling/"
 echo "synced $(pwd) -> root@$HOST:/workspace/vllm-tp2-profiling/"
 
-FA2="$HOME/Documents/Personal/triton-fa2-forward"
+FA2="${TPPROF_FA2_DIR:-$HOME/Documents/Personal/triton-fa2-forward}"   # Project 1 checkout; override per machine
 if [ -d "$FA2" ]; then
     rsync -az --delete --exclude .venv -e "ssh -p $PORT" "$FA2/" "root@$HOST:/workspace/triton-fa2-forward/"
     echo "synced $FA2 -> root@$HOST:/workspace/triton-fa2-forward/"

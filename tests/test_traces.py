@@ -208,6 +208,40 @@ def test_gate_fails_when_last_step_has_no_kernels(tmp_path):
     assert "rank 1 has no kernels in its last step (step 19)" in gate.reasons
 
 
+def test_empty_scheduler_steps_are_not_steps(tmp_path):
+    # vLLM opens execute_context_0(0)_generation_0(0) when nothing is scheduled (seen after the last
+    # request finishes, 2026-10-01 box): no kernels, so it is not a forward step
+    ranks = _tp2()
+    for r in ranks:
+        r["steps"].insert(10, [0, 0, 0, 0])
+        r["steps"].append([0, 0, 0, 0])
+    db = _db(tmp_path, ranks)
+    td = traces.load_trace(db)
+    for pid, device in traces.worker_ranks(td):
+        steps = traces.assign_steps(td, pid, device)
+        assert len(steps) == 20
+        assert all(s["n_gen_reqs"] == 1 for s in steps)
+        assert all(s["ar_ops"] == 65 for s in steps)
+    assert traces.completeness_gate(td, tp=2, min_steps=5).ok
+
+
+def test_gate_still_catches_truncation_before_trailing_empty_step(tmp_path):
+    ranks = _tp2()
+    for r in ranks:
+        r["steps"].append([0, 0, 0, 0])
+    db = _db(tmp_path, ranks)
+    last = traces.step_ranges(traces.load_trace(db), 42421)[-1].start
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE globalPid = ? AND correlationId IN (SELECT "
+                "correlationId FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE globalTid >> 24 = ? AND start >= ?)",
+                (42421 << 24, 42421, last))
+    con.commit()
+    con.close()
+    gate = traces.completeness_gate(traces.load_trace(db), tp=2, min_steps=5)
+    assert not gate.ok
+    assert "rank 1 has no kernels in its last step (step 19)" in gate.reasons
+
+
 def test_gate_passes_tp1(tmp_path):
     db = _db(tmp_path, [_rank(4240, 0, tp=1, ar_backend="none")])
     td = traces.load_trace(db)

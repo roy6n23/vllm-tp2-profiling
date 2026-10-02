@@ -175,11 +175,18 @@ def _measure(td: TraceData) -> tuple[int, int] | None:
     return None
 
 
+def _is_forward(text: str) -> bool:
+    """False for execute_context_0(0)_generation_0(0): vLLM opens it when nothing is scheduled and it
+    launches no kernels, so it is not a forward step (2026-10-01 box: one after the last request)."""
+    m = STEP_RE.match(text)
+    return m is not None and (m.group(1) != "0" or m.group(3) != "0")
+
+
 def step_ranges(td: TraceData, pid: int) -> list[Range]:
-    """vLLM's execute_context_* ranges of that pid, by start; inside tpprof:measure if present."""
+    """vLLM's execute_context_* forward ranges of that pid, by start; inside tpprof:measure if present."""
     window = _measure(td)
     return [r for r in td.ranges
-            if r.pid == pid and STEP_RE.match(r.text)
+            if r.pid == pid and _is_forward(r.text)
             and (window is None or window[0] <= r.start <= window[1])]
 
 

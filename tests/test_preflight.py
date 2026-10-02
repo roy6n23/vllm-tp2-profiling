@@ -235,6 +235,13 @@ def test_pinned_thresholds_come_from_constants(tmp_path, roomy, monkeypatch):
     by = _by_name(preflight.full_checks(_ctx(tmp_path)))
     assert not by["flashinfer_jit_cache"].ok and "0.6.17" in by["flashinfer_jit_cache"].detail
     assert f"{dist}=={want}" in by["flashinfer_jit_cache"].fix
+    # the pinned image reports a PEP 440 local label (2026-10-01 box): same release, so it passes
+    installed[dist] = want + "+cu130"
+    by = _by_name(preflight.full_checks(_ctx(tmp_path)))
+    assert by["flashinfer_jit_cache"].ok, by["flashinfer_jit_cache"].detail
+    installed[dist] = "0.6.17+cu130"
+    by = _by_name(preflight.full_checks(_ctx(tmp_path)))
+    assert not by["flashinfer_jit_cache"].ok
     monkeypatch.setattr(constants, "MIN_CPUS", 10**6)
     by = _by_name(preflight.quick_checks(_ctx(tmp_path)))
     assert not by["cpus"].ok and str(10**6) in by["cpus"].detail
@@ -258,6 +265,55 @@ def test_nsys_gate(tmp_path):
     env["TPPROF_NSYS"] = str(tmp_path / "missing-nsys")
     missing = preflight.check_nsys(_ctx(tmp_path, env=env))
     assert not missing.ok and constants.NSYS_APT_PACKAGE in missing.fix
+
+
+NVLS_WARN = ("transport/nvls.cc:379 (nvlsAllocateMem) NCCL WARN Failed to bind NVLink SHARP (NVLS) Multicast "
+             "memory of size 2097152 : CUDA error 401 'the operation cannot be performed in the present state'.")
+
+
+def _fake_probe(monkeypatch, *outcomes):
+    """Replace run_text for the NCCL probe: outcome i answers call i; records each call's env."""
+    calls = []
+
+    def run(argv, env, timeout_s):
+        # mp.spawn children re-import __main__, which `python -c` cannot provide: run a script file
+        assert "-c" not in argv
+        with open(argv[1]) as f:
+            assert f.read() == preflight.NCCL_PROBE
+        calls.append(dict(env))
+        return outcomes[len(calls) - 1]
+    monkeypatch.setattr(preflight, "run_text", run)
+    return calls
+
+
+def test_nccl_allreduce_passes(tmp_path, monkeypatch):
+    calls = _fake_probe(monkeypatch, (0, "rank 0 NCCL_AR_OK\nrank 1 NCCL_AR_OK\n", ""))
+    check = preflight._nccl_allreduce(_ctx(tmp_path, on_box=True))
+    assert check.ok and check.hard
+    assert len(calls) == 1 and "NCCL_NVLS_ENABLE" not in calls[0]   # vLLM's default NCCL setup
+
+
+def test_nccl_allreduce_names_a_broken_nvls_host(tmp_path, monkeypatch):
+    # 2026-10-01 box: multicast advertised, binding it fails; with NVLS off the same all-reduce works
+    calls = _fake_probe(monkeypatch, (1, "", NVLS_WARN + "\nTraceback ...\n"),
+                        (0, "rank 0 NCCL_AR_OK\nrank 1 NCCL_AR_OK\n", ""))
+    check = preflight._nccl_allreduce(_ctx(tmp_path, on_box=True))
+    assert not check.ok and check.hard
+    assert calls[1]["NCCL_NVLS_ENABLE"] == "0"
+    assert "NVLS" in check.detail and "CUDA error 401" in check.detail
+    assert "terminate" in check.fix
+
+
+def test_nccl_allreduce_fails_without_nvls_too(tmp_path, monkeypatch):
+    _fake_probe(monkeypatch, (1, "", "NCCL WARN something else\n"), (1, "", "NCCL WARN something else\n"))
+    check = preflight._nccl_allreduce(_ctx(tmp_path, on_box=True))
+    assert not check.ok and "also fails with NCCL_NVLS_ENABLE=0" in check.detail
+
+
+def test_nccl_probe_is_valid_python_and_full_checks_run_it_on_box_only(tmp_path, roomy):
+    compile(preflight.NCCL_PROBE, "<nccl_probe>", "exec")
+    assert "nccl_allreduce" not in _by_name(preflight.full_checks(_ctx(tmp_path)))
+    assert "nccl_allreduce" not in preflight.SOFT
 
 
 def test_monitor_field_falls_back_to_legacy_name(tmp_path):

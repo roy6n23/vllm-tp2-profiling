@@ -30,6 +30,8 @@ from tpprof.constants import H100_SXM, VLLM_IMAGE  # noqa: E402
 DEFAULT_API_BASE = "https://rest.runpod.io/v1"
 POLL_INTERVAL_S = 10.0
 HTTP_TIMEOUT_S = 30.0
+# rest.runpod.io's Cloudflare rejects urllib's default "Python-urllib/3.x" (403, error 1010), so name the client
+USER_AGENT = "tpprof-runpod/1.0 (+https://github.com/roy6n23/vllm-tp2-profiling)"
 
 # The image ENTRYPOINT is `vllm serve` (D9-3), so the pod runs `bash -c <START_CMD>` instead. SSH sessions
 # do not inherit the Docker ENV, hence the export -p snapshot that bootstrap_box.sh sources (AM28).
@@ -59,7 +61,7 @@ def api_base() -> str:
 
 def request(method: str, path: str, api_key: str, body: dict | None = None) -> dict:
     data = None if body is None else json.dumps(body).encode()
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "User-Agent": USER_AGENT}
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(api_base() + path, data=data, method=method, headers=headers)

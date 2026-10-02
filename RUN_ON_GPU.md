@@ -79,7 +79,8 @@ scripts/sync_to_box.sh <ip> <port>
 ```
 
 This rsyncs this checkout to `/workspace/vllm-tp2-profiling/` and, if present,
-`~/Documents/Personal/triton-fa2-forward` to `/workspace/triton-fa2-forward/`.
+`~/Documents/Personal/triton-fa2-forward` to `/workspace/triton-fa2-forward/`
+(set `TPPROF_FA2_DIR` if that checkout lives elsewhere).
 It uses `--delete`: a re-sync removes box files that are missing on the Mac,
 including run records under `results/`. **Pull `results/` back (step 9) before
 any re-sync during the rental.**
@@ -231,6 +232,7 @@ in the RunPod console that the pod is gone.
 | Quick preflight: `topology` is NV12 (not NV18) | Terminate and retry. Accept it only if no NV18 host is available, and then note it in the README (see below). |
 | Quick preflight: `fabric` not registered | Wait a minute and rerun `bootstrap_box.sh`. If it persists, terminate and retry. |
 | Quick preflight: `shm`, `/dev/shm` < 1 GiB | The container cannot change it. Switch provider (the fallback is a Lambda `gpu_2x_h100_sxm5` VM with `docker run --gpus all --ipc=host --entrypoint bash`). |
+| Full preflight: `nccl_allreduce` says NVLS is broken on this host | Multicast is advertised but binding it fails (CUDA error 401), so every TP2 engine dies in `ncclCommInitRank`. A host fault, not a gate bug: terminate and create a new pod. Do not skip it, and do not set `NCCL_NVLS_ENABLE=0`, which changes every communication number. |
 | A trace run hangs | Handled automatically: the trace is retried once with `VLLM_ALLREDUCE_USE_SYMM_MEM=0` (vLLM #48486), and the retry is recorded in the run's notes. If the retry also hangs, the run fails and the tier goes on. |
 | `traces --check` fails on the unclassified share | It lists the top unclassified kernel names. Add regexes for them in `/workspace/vllm-tp2-profiling/tpprof/kernels.py` on the box (tpprof is installed editable), rerun `python -m tpprof traces --check`, then copy the file back: on the Mac, `scp -P <port> root@<ip>:/workspace/vllm-tp2-profiling/tpprof/kernels.py tpprof/kernels.py`. |
 | A preflight gate is wrong, not the box | Override that one gate with a recorded `--skip-gate NAME` on `preflight` and on `run`, e.g. `python -m tpprof run --tier P0 --skip-gate model_files`. The override is written to `preflight.json`. |
