@@ -92,6 +92,17 @@ def goodput_rows(points_by_config: Mapping[str, Sequence[RatePoint]], gpus: Mapp
     return rows
 
 
+def s_star(points_by_config: Mapping[str, Sequence[RatePoint]], tpot_slos_ms: Sequence[float],
+           ttft_slo_s: float) -> float | None:
+    """s* of TP2 vs DP2 from their RatePoints: the point estimate of the statistic bootstrap_s_star resamples.
+    None if TP2 or DP2 is missing or there is no crossover."""
+    if "TP2" not in points_by_config or "DP2" not in points_by_config:
+        return None
+    curves = {c: [gp for gp, _ in _curve([(p.rate, p.ttft_s, p.tpot_s) for p in points_by_config[c]],
+                                         ttft_slo_s, tpot_slos_ms)] for c in ("TP2", "DP2")}
+    return crossover(tpot_slos_ms, curves["TP2"], curves["DP2"])
+
+
 def _resampled_s_star(arrays: Mapping[str, list], tpot_slos_ms: Sequence[float], ttft_slo_s: float,
                       rng: np.random.Generator) -> float | None:
     curves = {}

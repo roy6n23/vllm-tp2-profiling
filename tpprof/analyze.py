@@ -512,17 +512,40 @@ def client_window(sub_dir: str, session_dir: str, k: int) -> tuple[float, float]
 _CPU_NONE = {"api": None, "client": None, "samples": 0, "bad_rows": 0}
 
 
+def bench_window(sub_dir: str, session_dir: str, k: int) -> tuple[float, float] | None:
+    """The benchmark phase of client run sub-<k>: the last `duration` seconds (result*.json, the longest for
+    DP2-rand) before the client command ended. It leaves out the client's startup (imports, tokenizer load,
+    dataset build), which alone pushed the client's p90 to ~100% of a core on the 2026-10-02 box."""
+    window = client_window(sub_dir, session_dir, k)
+    durations = [finite(_read_json(p).get("duration")) for p in sorted(glob.glob(os.path.join(sub_dir, "result*.json")))]
+    durations = [d for d in durations if d is not None and d > 0]
+    if window is None or not durations:
+        return None
+    return max(window[0], window[1] - max(durations)), window[1]
+
+
 def _cpu_for(sub_dir: str, session_dir: str, k: int) -> tuple[dict, str | None, str | None, list[str]]:
     """AM11 CPU p90 of one client run: (values, scope, note, errors).
 
-    scope "run": sub-<k>/cpu.csv, or the session cpu.csv inside the client's cmd.json window. scope "session":
-    no window was found, so the p90 is over the whole session, startup included. Parse problems never drop the
+    scope "bench": only the samples of the benchmark phase (bench_window), from sub-<k>/cpu.csv or the session
+    cpu.csv. scope "run": no benchmark duration, so sub-<k>/cpu.csv whole or the session cpu.csv inside the
+    client's cmd.json window, client startup included. scope "session": no window at all, startup included. Parse problems never drop the
     client result (Review Focus 2): they come back as a note and, when the file is unusable, as an error."""
     sub_csv, session_csv = os.path.join(sub_dir, "cpu.csv"), os.path.join(session_dir, "cpu.csv")
     notes: list[str] = []
     try:
         name = f"sub-{k}/cpu.csv" if os.path.exists(sub_csv) else "cpu.csv"
-        if os.path.exists(sub_csv):
+        try:
+            bench = bench_window(sub_dir, session_dir, k)
+        except _PARSE_ERRORS as e:
+            bench = None
+            notes.append(f"benchmark window: {e}")
+        if bench is not None and (os.path.exists(sub_csv) or os.path.exists(session_csv)):
+            cpu, scope = cpu_p90(sub_csv if os.path.exists(sub_csv) else session_csv, bench), "bench"
+            if not cpu["samples"]:
+                notes.append(f"{name}: no API-server or client samples in the benchmark window "
+                             f"[{bench[0]:.3f}, {bench[1]:.3f}]")
+        elif os.path.exists(sub_csv):
             cpu, scope = cpu_p90(sub_csv), "run"
         elif os.path.exists(session_csv):
             try:
@@ -618,7 +641,8 @@ def _sub_row(run: Run, k: int, sub: str) -> tuple[dict, results.ServeResult, lis
     if throttled:
         flags.append("throttled")
     if any(cpu[role] is not None and cpu[role] > CPU_FLAG_PCT for role in ("api", "client")):
-        flags.append("cpu>80%" if cpu_scope == "run" else "cpu>80% (session-wide p90)")
+        flags.append({"bench": "cpu>80%", "run": "cpu>80% (incl. client startup)"}.get(
+            cpu_scope, "cpu>80% (session-wide p90)"))
     violations = [v for v in (row["violations"], "; ".join(map(str, validation.get("violations", [])))) if v]
     row.update({
         "valid": bool(row["valid"] and validation.get("valid", True)),
@@ -740,11 +764,15 @@ def _s_star(points: Mapping[tuple[int, str], Mapping[str, Sequence[goodput.RateP
                      "note": None if star is not None else "no crossover in the swept TPOT SLOs"})
     if rows:
         stars = [r["s_star_ms"] for r in rows if r["s_star_ms"] is not None]
-        lo, hi = goodput.bootstrap_s_star(_pooled(points, keys), TPOT_SLOS_MS, TTFT_SLO_S, n_boot=S_STAR_BOOT, seed=0)
+        pooled = _pooled(points, keys)
+        lo, hi = goodput.bootstrap_s_star(pooled, TPOT_SLOS_MS, TTFT_SLO_S, n_boot=S_STAR_BOOT, seed=0)
+        # s_star_ms is the median of the rounds; the CI belongs to the pooled-request s*, a different estimator,
+        # and covers within-run request noise only (the range over rounds is the run-to-run uncertainty)
         rows.append({"row": "all", "round": None, "arm": "base", "s_star_ms": median_or_none(stars),
                      "s_star_min": min(stars) if stars else None, "s_star_max": max(stars) if stars else None,
-                     "n_rounds": len(rows), "n_crossover": len(stars), "ci_lo_ms": lo, "ci_hi_ms": hi,
-                     "note": "CI: request-level bootstrap over the rounds pooled per grid rate"})
+                     "n_rounds": len(rows), "n_crossover": len(stars),
+                     "s_star_pooled_ms": goodput.s_star(pooled, TPOT_SLOS_MS, TTFT_SLO_S), "ci_lo_ms": lo, "ci_hi_ms": hi,
+                     "note": "s*: median of the rounds; CI: request-level bootstrap of the pooled-request s*"})
     return rows
 
 

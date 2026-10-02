@@ -92,6 +92,9 @@ def test_bootstrap_s_star_brackets_synthetic_crossover():
     assert lo is not None and hi is not None
     assert 10 <= lo <= hi <= 15
     assert (lo, hi) == g.bootstrap_s_star(pts, slos, 1.0, n_boot=100, seed=0)
+    # the point estimate of the statistic the bootstrap resamples
+    assert g.s_star(pts, slos, 1.0) == point
+    assert g.s_star({"TP2": pts["TP2"]}, slos, 1.0) is None
 
 
 def test_bootstrap_s_star_none_without_crossover_or_configs():

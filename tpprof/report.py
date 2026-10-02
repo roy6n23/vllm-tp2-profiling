@@ -81,9 +81,11 @@ def _headline(t: Tables, hyps: Sequence[dict]) -> list[str]:
     star = next((r for r in t.get("s_star", []) if r.get("row") == "all"), None)
     if star and star.get("s_star_ms") is not None:
         out.append(f"- **s\\* = {_f(star['s_star_ms'])} ms** (median over {star['n_crossover']}/{star['n_rounds']} "
-                   f"rounds with a crossover; range {_f(star['s_star_min'])}–{_f(star['s_star_max'])} ms; bootstrap "
-                   f"95% CI {_f(star['ci_lo_ms'])}–{_f(star['ci_hi_ms'])} ms). Below s\\*, TP2 gets more goodput "
-                   "from two GPUs than two replicas do.")
+                   f"rounds with a crossover; range {_f(star['s_star_min'])}–{_f(star['s_star_max'])} ms, which is "
+                   "the run-to-run uncertainty). Below s\\*, TP2 gets more goodput from two GPUs than two replicas "
+                   f"do. Pooling every round's requests: pooled-request s\\* {_f(star.get('s_star_pooled_ms'))} ms "
+                   f"(request-level bootstrap 95% CI {_f(star['ci_lo_ms'])}–{_f(star['ci_hi_ms'])} ms; within-run "
+                   "noise only).")
     else:
         out.append("- s\\*: not measured (see H4 and Gaps).")
     b_lo, b_hi = min(DECODE_BATCHES), max(DECODE_BATCHES)
@@ -151,9 +153,10 @@ def _online(t: Tables) -> list[str]:
                    "grid mu (req/s)"),
                   ((r["config"], r["arm"], r["phase"], r["n_seeds"], _f(r["mu_tps"]), _f(r["mu_rps"]),
                     _f(r["preempt_per_1k"]), _f(r.get("grid_mu_rps"))) for r in sat if r.get("row") == "median"))
-    out += ["### Client runs", "", "CPU p90 is per client run: the samples of the session's cpu.csv inside the "
-            "client's cmd.json window (AM11). A value marked `(session)` had no window and covers the whole "
-            "session, startup included.", ""]
+    out += ["### Client runs", "", "CPU p90 is per client run, over the benchmark phase only: the last `duration` "
+            "seconds before the client exited, which leaves out the client's own startup (AM11). A value marked "
+            "`(run)` had no benchmark duration and includes the client's startup; `(session)` had no window at all "
+            "and covers the whole session. 100% is one core.", ""]
     runs = sorted(t.get("online_runs", []), key=lambda r: (str(r["phase"]), str(r["config"]), str(r["arm"]),
                                                            r["round"] or 0, r["rate_target"] or 0))
     out += _table(("phase", "config", "arm", "round", "rate", "valid", "tput (tok/s)", "TTFT p50/p99 (ms)",
@@ -162,7 +165,7 @@ def _online(t: Tables) -> list[str]:
                     _f(r["tput_uniform_tps"]), f"{_ms(r['ttft_p50_s'])} / {_ms(r['ttft_p99_s'])}",
                     f"{_ms(r['tpot_p50_s'])} / {_ms(r['tpot_p99_s'])}", _f(r["preemptions"]),
                     f"{_f(r['cpu_api_p90'], 3)} / {_f(r['cpu_client_p90'], 3)}"
-                    + (" (session)" if r.get("cpu_scope") == "session" else ""), r["flags"] or "")
+                    + {"run": " (run)", "session": " (session)"}.get(r.get("cpu_scope"), ""), r["flags"] or "")
                    for r in runs))
     out += [f"### Goodput (req/s, TTFT <= {TTFT_SLO_S:g} s, median over rounds)", ""]
     gp = [r for r in t.get("goodput", []) if r.get("ttft_slo_s") == TTFT_SLO_S and r.get("arm") == "base"]
@@ -173,8 +176,11 @@ def _online(t: Tables) -> list[str]:
                                                  if r["config"] == c and r["tpot_slo_ms"] == slo)) for c in configs)))
     out += _table(("TPOT SLO (ms)", *configs), rows if configs else [])
     out += ["### s* per round", ""]
-    out += _table(("round", "s* (ms)", "bootstrap CI (ms)", "note"),
-                  ((r["round"] if r["row"] == "round" else "all", _f(r["s_star_ms"]),
+    out += ["Per-round CIs resample requests within one run, so they leave out run-to-run variance; compare "
+            "the rounds instead.", ""]
+    out += _table(("round", "s* (ms)", "pooled-request s* (ms)", "bootstrap CI (ms)", "note"),
+                  ((r["round"] if r["row"] == "round" else "all (median)", _f(r["s_star_ms"]),
+                    _f(r.get("s_star_pooled_ms")) if r["row"] == "all" else "",
                     f"{_f(r['ci_lo_ms'])}–{_f(r['ci_hi_ms'])}", r.get("note") or "") for r in t.get("s_star", [])))
     return out
 

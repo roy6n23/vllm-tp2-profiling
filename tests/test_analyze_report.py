@@ -117,6 +117,8 @@ def test_online_saturation_goodput_and_s_star(tables):
     summary = next(r for r in star if r["row"] == "all")
     assert summary["s_star_min"] <= summary["s_star_ms"] <= summary["s_star_max"]
     assert summary["ci_lo_ms"] is not None and summary["ci_lo_ms"] <= summary["ci_hi_ms"]
+    # the request-level CI belongs to the pooled s*, not to the median of the rounds (2026-10-02 report)
+    assert summary["ci_lo_ms"] <= summary["s_star_pooled_ms"] <= summary["ci_hi_ms"]
 
 
 def _session(raw: str, prefix: str) -> str:
@@ -124,11 +126,11 @@ def _session(raw: str, prefix: str) -> str:
 
 
 def test_cpu_p90_is_per_client_run(records, tables):
-    """AM11: each client run gets the p90 of its own cmd.json window, not of the whole session."""
+    """AM11: each client run gets the p90 of its own benchmark phase, not of the whole session."""
     session = _session(os.path.join(records, "raw"), "P1-serve_session-TP2-base-r1")
     rows = sorted((r for r in tables["online_runs"] if r["run_id"] == os.path.basename(session)),
                   key=lambda r: r["sub"])
-    assert len(rows) == 6 and all(r["cpu_scope"] == "run" and r["cpu_samples"] for r in rows)
+    assert len(rows) == 6 and all(r["cpu_scope"] == "bench" and r["cpu_samples"] for r in rows)
     levels = [make_records.api_cpu_level(make_records.matrix.RunSpec("serve_session", "TP2", "base", "P1",
                                                                      (("phase", "sweep"),)), k, 6) for k in range(6)]
     for r, level in zip(rows, levels):
@@ -553,3 +555,35 @@ def test_points_count_only_from_an_engine_that_passed_the_check(tmp_path):
         assert (s.run_id, "effective_config") in gaps
     derived = [r for r in tables["offline_points"] if r["config"] == "DP2" and r["derived"]]
     assert derived and all(r["gpu_asym"] is None for r in derived)   # no vetted GPU1 step to compare with
+
+
+def test_headline_pairs_the_bootstrap_ci_with_the_pooled_s_star():
+    # 2026-10-02 report printed "s* = 17.69 ms ... bootstrap 95% CI 18.82-19.03": the median of the rounds
+    # next to the CI of the pooled-request s* (18.93), which does not contain it
+    star = {"row": "all", "s_star_ms": 17.69, "s_star_min": 12.31, "s_star_max": 18.04, "n_crossover": 3,
+            "n_rounds": 3, "s_star_pooled_ms": 18.93, "ci_lo_ms": 18.82, "ci_hi_ms": 19.03}
+    text = "\n".join(report._headline({"s_star": [star]}, []))
+    assert "s\\* = 17.69 ms" in text and "range 12.31–18.04 ms" in text
+    assert "pooled-request s\\* 18.93 ms (request-level bootstrap 95% CI 18.82–19.03 ms" in text
+    assert "17.69 ms** (median over 3/3 rounds with a crossover; range 12.31–18.04 ms; bootstrap" not in text
+
+
+def test_client_cpu_counts_only_the_benchmark_phase(tmp_path):
+    # 2026-10-02 box: the client p90 read ~100% from 10-15 s of startup (imports, tokenizer, dataset) while
+    # the benchmark phase never passed ~65%. The window is the last `duration` seconds before the client exits.
+    session, sub = tmp_path / "run", tmp_path / "run" / "sub-0"
+    sub.mkdir(parents=True)
+    client = "vllm bench serve --result-dir " + str(sub)
+    with open(sub / "cpu.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(("t_wall", "pid", "ppid", "name", "cmd", "cpu_percent", "rss_mib"))
+        for t in range(100, 160):
+            w.writerow((t, 7, 1, "python", client, 150.0 if t < 112 else 40.0, 900))
+            w.writerow((t, 5, 1, "python", "vllm serve /m", 60.0, 900))
+    (session / "cmd.json").write_text(json.dumps([{"argv": client.split(), "t_wall_start": 100.0,
+                                                    "t_wall_end": 160.0}]))
+    (sub / "result.json").write_text(json.dumps({"duration": 47.5}))
+    cpu, scope, note, errors = analyze._cpu_for(str(sub), str(session), 0)
+    assert scope == "bench" and not errors
+    assert cpu["client"] == pytest.approx(40.0) and cpu["api"] == pytest.approx(60.0)
+    assert cpu["samples"] == 2 * 47                    # t = 113 .. 159 inside [112.5, 160]
