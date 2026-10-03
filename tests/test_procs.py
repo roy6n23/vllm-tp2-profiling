@@ -195,16 +195,18 @@ def test_raise_nofile(tmp_path):
 
 def test_raise_nofile_never_lowers(tmp_path):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if hard != resource.RLIM_INFINITY and hard <= 65535:
-        pytest.skip("hard limit too low to test a soft limit above 65535")
+    # a soft limit above the target, but not above the hard limit (GitHub runners: hard = 65536)
+    above = 70000 if hard == resource.RLIM_INFINITY else min(70000, hard)
+    if above <= procs.NOFILE_TARGET:
+        pytest.skip(f"hard limit {hard} leaves no soft limit above {procs.NOFILE_TARGET} to test")
     code = "import resource; print(resource.getrlimit(resource.RLIMIT_NOFILE)[0])"
-    resource.setrlimit(resource.RLIMIT_NOFILE, (70000, hard))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (above, hard))
     try:
         p = procs.spawn([PY, "-c", code], dict(os.environ), str(tmp_path / "log"), "r", raise_nofile=True)
         assert procs.wait(p, 10) == 0
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-    assert int((tmp_path / "log").read_text()) == 70000
+    assert int((tmp_path / "log").read_text()) == above
 
 
 def test_gpu_memory_used_and_processes(tmp_path):

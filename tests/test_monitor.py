@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -128,10 +129,17 @@ def test_throttle_flags_empty_csv(tmp_path):
 
 def test_cpu_sampler_on_current_process(tmp_path):
     csv_path = tmp_path / "cpu.csv"
+    me = f",{os.getpid()},"
+    blob = b"x" * (8 << 20)
+    # Burn CPU in a way that releases the GIL (hashlib does for large buffers). A pure-Python busy loop
+    # starved the sampler thread on GitHub runners: walking ~300 /proc entries gives up the GIL hundreds
+    # of times, and the first sample alone outlasted a 0.6 s window (reproduced with 300 extra processes).
     with monitor.CpuSampler(str(csv_path), lambda: [os.getpid()], interval_s=0.1):
-        t_end = time.monotonic() + 0.6
-        while time.monotonic() < t_end:
-            sum(range(10000))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            hashlib.sha256(blob).digest()
+            if csv_path.read_text().count(me) >= 2:
+                break
     with open(csv_path, newline="") as fh:
         rows = list(csv.DictReader(fh))
     assert rows, "no rows written"
