@@ -315,22 +315,22 @@ The decode model of `predictions.md` with the constants that can be measured wit
 
 ## Traces
 
-Traced shares are fractions of the traced window; nsys step times are not headline latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16). A trace that fails the completeness gate is listed but decides no hypothesis (spec 4.5). TP2 comm = fused AR time - TP1's per-step fused_add_rms_norm time (AM16); AR1-AR3 are unfused, so their AR time is comm. Per-step rows are in `tidy/trace_steps.csv`.
+Traced shares are fractions of the traced window; nsys step times are not headline latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16). Busy and idle by rank are each rank's own busy time per step and 1 - that / the same untraced step; idle_est is their mean. A GPU that spin-waits inside an all-reduce kernel for the other rank counts as busy (the AR sync column). The busy time comes from the traced run, whose step is longer than the untraced one, so a waiting rank's idle can be negative. A trace that fails the completeness gate is listed but decides no hypothesis (spec 4.5). TP2 comm = fused AR time - TP1's per-step fused_add_rms_norm time (AM16); AR1-AR3, G2 and any trace with standalone norm kernels are unfused, so their AR time is comm. Per-step rows are in `tidy/trace_steps.csv`.
 
-| config | arm | points | gate | steps | AR/AG per step (mode) | idle_est | unclassified | AR wire / sync (ms/step) | AR / TP1 norm / comm (ms/step) | run |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TP1 | base | decode:b1 | ok | 256 | 0 / 0 | 0.0328 | 0.00181 | n/a / n/a |  | P0-trace-TP1-base-r0-2d7e12bf |
-| TP1 | base | decode:b32 | ok | 261 | 0 / 0 | 0.0298 | 0.00165 | n/a / n/a |  | P0-trace-TP1-base-r0-d0affa81 |
-| TP1 | base | prefill:2048 | ok | 5 | 0 / 0 | 0.211 | 0.000876 | n/a / n/a |  | P0-trace-TP1-base-r0-5b8c95bd |
-| TP2 | base | decode:b1 | ok | 256 | 65 / 1 | 0.039 | 0.00288 | 0.294 / 0.144 | 0.347 / 0.143 / 0.204 | P0-trace-TP2-base-r0-bbf7d5bb |
-| TP2 | base | decode:b32 | ok | 261 | 65 / 1 | 0.00651 | 0.00232 | 0.408 / 0.0965 | 0.45 / 0.153 / 0.297 | P0-trace-TP2-base-r0-d2ca73df |
-| TP2 | base | prefill:2048 | ok | 5 | 65 / 1 | 0.255 | 0.00135 | 5.96 / 1.31 | 6.21 / 1.29 / 4.92 | P0-trace-TP2-base-r0-b04c881e |
-| TP2 | G2 | decode:b1 | ok | 256 | 65 / 1 | 0.252 | 0.00288 | 0.256 / 12.3 | 0.256 / 0.143 / 0.113 | P0-trace-TP2-G2-r0-a145952f |
-| TP2 | AR1 | decode:b1 | ok | 256 | 65 / 1 | 0.0428 | 0.00286 | 0.217 / 0.0775 | 0.252 / n/a / 0.252 | P2-trace-TP2-AR1-r0-d50c54a9 |
-| TP2 | AR2 | decode:b1 | ok | 256 | 65 / 1 | 0.0409 | 0.00288 | 0.295 / 0.114 | 0.322 / n/a / 0.322 | P2-trace-TP2-AR2-r0-503e794d |
-| TP2 | AR3 | decode:b1 | ok | 256 | 65 / 1 | 0.0751 | 0.00278 | 0.406 / 0.0693 | 0.44 / n/a / 0.44 | P2-trace-TP2-AR3-r0-6a72aec8 |
-| TP1 | G1 | decode:b1 | ok | 256 | 0 / 0 | 0.285 | 0.00187 | n/a / n/a |  | P2-trace-TP1-G1-r0-075888da |
-| TP2 | G1 | decode:b1 | ok | 256 | 65 / 1 | 0.208 | 0.0029 | 0.336 / 9.55 | 0.44 / 0.142 / 0.298 | P2-trace-TP2-G1-r0-faa4b0ea |
+| config | arm | points | gate | steps | AR/AG per step (mode) | idle_est | busy by rank (ms/step) | idle by rank | unclassified | AR wire / sync (ms/step) | AR / TP1 norm / comm (ms/step) | run |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| TP1 | base | decode:b1 | ok | 256 | 0 / 0 | 0.0328 | 6.09 | 0.0328 | 0.00181 | n/a / n/a |  | P0-trace-TP1-base-r0-2d7e12bf |
+| TP1 | base | decode:b32 | ok | 261 | 0 / 0 | 0.0298 | 7.93 | 0.0298 | 0.00165 | n/a / n/a |  | P0-trace-TP1-base-r0-d0affa81 |
+| TP1 | base | prefill:2048 | ok | 5 | 0 / 0 | 0.211 | 43.2 | 0.211 | 0.000876 | n/a / n/a |  | P0-trace-TP1-base-r0-5b8c95bd |
+| TP2 | base | decode:b1 | ok | 256 | 65 / 1 | 0.039 | 3.92 / 3.92 | 0.0401 / 0.0378 | 0.00288 | 0.294 / 0.144 | 0.347 / 0.143 / 0.204 | P0-trace-TP2-base-r0-bbf7d5bb |
+| TP2 | base | decode:b32 | ok | 261 | 65 / 1 | 0.00651 | 5.07 / 5.08 | 0.00682 / 0.00621 | 0.00232 | 0.408 / 0.0965 | 0.45 / 0.153 / 0.297 | P0-trace-TP2-base-r0-d2ca73df |
+| TP2 | base | prefill:2048 | ok | 5 | 65 / 1 | 0.255 | 27.6 / 28.4 | 0.265 / 0.244 | 0.00135 | 5.96 / 1.31 | 6.21 / 1.29 / 4.92 | P0-trace-TP2-base-r0-b04c881e |
+| TP2 | G2 | decode:b1 | ok | 256 | 65 / 1 | 0.252 | 4.15 / 16.5 | 0.7 / -0.196 | 0.00288 | 0.256 / 12.3 | 0.256 / n/a / 0.256 | P0-trace-TP2-G2-r0-a145952f |
+| TP2 | AR1 | decode:b1 | ok | 256 | 65 / 1 | 0.0428 | 3.95 / 3.94 | 0.0413 / 0.0443 | 0.00286 | 0.217 / 0.0775 | 0.252 / n/a / 0.252 | P2-trace-TP2-AR1-r0-d50c54a9 |
+| TP2 | AR2 | decode:b1 | ok | 256 | 65 / 1 | 0.0409 | 3.99 / 4.05 | 0.0484 / 0.0334 | 0.00288 | 0.295 / 0.114 | 0.322 / n/a / 0.322 | P2-trace-TP2-AR2-r0-503e794d |
+| TP2 | AR3 | decode:b1 | ok | 256 | 65 / 1 | 0.0751 | 4.1 / 4.1 | 0.0756 / 0.0746 | 0.00278 | 0.406 / 0.0693 | 0.44 / n/a / 0.44 | P2-trace-TP2-AR3-r0-6a72aec8 |
+| TP1 | G1 | decode:b1 | ok | 256 | 0 / 0 | 0.285 | 6.14 | 0.285 | 0.00187 | n/a / n/a |  | P2-trace-TP1-G1-r0-075888da |
+| TP2 | G1 | decode:b1 | ok | 256 | 65 / 1 | 0.208 | 4.08 / 13.5 | 0.633 / -0.217 | 0.0029 | 0.336 / 9.55 | 0.44 / 0.142 / 0.298 | P2-trace-TP2-G1-r0-faa4b0ea |
 
 ## Why TP2 is not 2x
 

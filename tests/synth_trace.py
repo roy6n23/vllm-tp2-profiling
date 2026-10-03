@@ -42,6 +42,11 @@ FI_TWOSHOT = ("void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel
 MNNVL_ONESHOT = ("void flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel<(unsigned char)2, "
                  "__nv_bfloat16, true, (flashinfer::QuantType)0>(flashinfer::trtllm_mnnvl_allreduce::"
                  "AllReduceFusionParams)")
+# The one-shot kernel without the RMSNorm (third template argument 0), as --enforce-eager runs it: no fusion
+# pass, so the residual add + RMSNorm stay standalone kernels (name from the 2026-10-02 G2 trace).
+MNNVL_ONESHOT_UNFUSED = ("void flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel<(unsigned char)2, "
+                         "__nv_bfloat16, (bool)0, (flashinfer::trtllm_mnnvl_allreduce::QuantType)0, float4>"
+                         "(flashinfer::trtllm_mnnvl_allreduce::AllReduceKernelParams<T2>)")
 MNNVL_TWOSHOT = ("void flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<(unsigned char)2, "
                  "__nv_bfloat16, true>(flashinfer::trtllm_mnnvl_allreduce::AllReduceFusionParams)")
 MNNVL_TAIL = ("void flashinfer::trtllm_mnnvl_allreduce::rmsNormLamport<__nv_bfloat16, (flashinfer::QuantType)0, "
@@ -73,7 +78,7 @@ ARGMAX = ("void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at
 UNKNOWN = "some_unknown_kernel_xyz"
 
 LAYERS = constants.LLAMA31_8B.layers
-_PDL = (FI_ONESHOT, FI_TWOSHOT, MNNVL_ONESHOT, MNNVL_TWOSHOT)
+_PDL = (FI_ONESHOT, FI_TWOSHOT, MNNVL_ONESHOT, MNNVL_ONESHOT_UNFUSED, MNNVL_TWOSHOT)
 
 TABLES = {
     "StringIds": "id INTEGER PRIMARY KEY, value TEXT NOT NULL",
@@ -105,6 +110,8 @@ def _ar_op(tp: int, ar_backend: str, batch: int) -> list[tuple[str, int]]:
         return [(FI_ONESHOT, 6_000)] if batch <= 4096 else [(FI_TWOSHOT, 12_000)]
     if ar_backend == "mnnvl":
         return [(MNNVL_ONESHOT, 5_000)] if batch <= 64 else [(MNNVL_TWOSHOT, 9_000), (MNNVL_TAIL, 3_000)]
+    if ar_backend == "mnnvl_unfused":
+        return [(MNNVL_ONESHOT_UNFUSED, 4_000), (FUSED_ADD_RMS_NORM, 2_500)]
     if ar_backend == "custom":
         return [(CUSTOM_AR, 7_000), (FUSED_ADD_RMS_NORM, 2_500)]
     if ar_backend == "nccl":

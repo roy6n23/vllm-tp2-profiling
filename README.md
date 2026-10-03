@@ -69,10 +69,17 @@ used FlashInfer's `mnnvl` fused all-reduce). P0–P2 took 0.7 + 2.2 + 1.2 h.
 | H7 | idle 0.039 / 0.208 / 0.252 (base / G1 / G2) | < 0.10, > 0.30 for G2, ordered | **miss** (G2 is 0.252, not > 0.30) |
 | H8 | 1.087 | 1.050–1.092 | hit |
 
-The misses are explained in [WORKLOG](WORKLOG.md) (2026-10-02): H5's model
-overstated non-KV memory and gave TP2 more of it than TP1 (measured 2.40 vs
-2.51 GiB per GPU); H7's threshold assumed eager mode only adds launch gaps,
-but it also roughly 2.6× the GPU work per step.
+The misses are explained in [WORKLOG](WORKLOG.md) (2026-10-02; the H7
+explanation was corrected on 2026-10-03). H5's model overstated non-KV memory
+and gave TP2 more of it than TP1 (measured 2.40 vs 2.51 GiB per GPU). H7's
+estimator counts a GPU that spin-waits inside an all-reduce kernel as busy.
+With CUDA graphs off, rank 0's GPU waits for its CPU to launch each kernel: it
+is busy for 4.1 ms per step, 4–6% more than in the baseline, and its idle share
+is 0.63 (G1) and 0.70 (G2). Rank 1's kernels are already queued, so its GPU
+spins in every all-reduce kernel until rank 0 gets there (9.7 and 12.5 ms per
+step). The estimate is the mean of the two ranks, 0.208 and 0.252. H7 stays a
+miss, because the rule was fixed before the run. An earlier version of this
+paragraph said eager mode did 2.6× the GPU work per step; that was wrong.
 
 **Why TP2 is not 2× (decode, batch 1).** Per step, from the traces: the mean over
 255 pure decode steps of the kernels in each category, TP2 averaged over its two

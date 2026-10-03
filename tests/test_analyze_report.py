@@ -6,6 +6,7 @@ import math
 import os
 import pathlib
 import shutil
+import statistics
 import sys
 
 import pytest
@@ -282,6 +283,61 @@ def test_tp2_gap_table_splits_the_traced_batch(records, tables):
     tp1_norm = 65 * 2_500 / 1e6                                               # tests/synth_trace.py
     assert by["norm_act_rope"]["tp2_ms"] - tp1_norm == pytest.approx(by["norm_act_rope"]["tp1_ms"] - tp1_norm)
     assert by["gemm"]["tp2_ms"] == pytest.approx(by["gemm"]["tp1_ms"] / 2, rel=0.01)   # synthetic GEMMs halve
+def test_comm_time_of_an_eager_trace_is_its_all_reduce_time(tmp_path):
+    """G2 (--enforce-eager) runs no fusion pass: its TP2 trace has the residual add + RMSNorm as standalone
+    kernels, so TP1's norm time is not subtracted from its all-reduce time (the 2026-10-02 G2 trace)."""
+    d = str(tmp_path / "results")
+    make_records.build(d, tiers=("P0",), rounds=1,
+                       sqlite_traces=(*make_records.SQLITE_TRACES, ("TP2", "G2", "decode:b1")))
+    rows = {(r["config"], r["arm"], r["points"], r["rank"]): r for r in analyze.analyze(d)["trace_summary"]}
+    g2 = rows[("TP2", "G2", "decode:b1", 0)]
+    assert g2["fused_add_rms_norm_ms"] == pytest.approx(65 * 2_500 / 1e6)     # standalone, as in TP1
+    assert g2["ar_fused"] is False and g2["tp1_norm_ms"] is None
+    assert g2["comm_ms"] == pytest.approx(g2["ar_ms"])
+    base = rows[("TP2", "base", "decode:b1", 0)]                              # no standalone norm kernels
+    assert base["fused_add_rms_norm_ms"] == 0 and base["ar_fused"]
+    assert base["comm_ms"] == pytest.approx(base["ar_ms"] - base["tp1_norm_ms"])
+
+
+def _comm_row(config: str, arm: str, norm_ms: float | None, ar_ms: float = 0.4) -> dict:
+    return {"config": config, "arm": arm, "tp": int(config[2]), "points": "decode:b1", "rank": 0, "gate_ok": True,
+            "ar_ms": ar_ms, "ar_ms_source": "trace.sqlite" if norm_ms is not None else "summary shares",
+            "fused_add_rms_norm_ms": norm_ms}
+
+
+def test_comm_time_reads_fusion_from_the_trace_and_falls_back_to_the_arm():
+    rows = [_comm_row("TP1", "base", 0.15, ar_ms=0.0),
+            _comm_row("TP2", "base", 0.0),         # no standalone norm kernels: the all-reduce kernel does the norm
+            _comm_row("TP2", "base", 0.13),        # standalone norm kernels (the fusion did not happen)
+            _comm_row("TP2", "base", None),        # no trace.sqlite: base is fused by design
+            _comm_row("TP2", "G2", None),          # no trace.sqlite: --enforce-eager runs no fusion pass
+            _comm_row("TP2", "AR3", None)]
+    analyze._comm_time(rows)
+    assert [r["ar_fused"] for r in rows] == [None, True, False, True, False, False]
+    assert [r["comm_ms"] for r in rows[1:]] == pytest.approx([0.25, 0.4, 0.25, 0.4, 0.4])
+    assert [r["tp1_norm_ms"] for r in rows[1:]] == [0.15, None, 0.15, None, None]
+    assert "standalone" in rows[2]["comm_note"]
+
+
+def test_trace_summary_has_busy_time_and_idle_per_rank(tables):
+    """idle_est (AM16) is one number per trace: 1 - the ranks' mean busy time per step / the untraced step. The
+    per-rank values behind it show a rank whose GPU is busy spin-waiting for the other one (2026-10-03, H7)."""
+    def trace(config: str, arm: str) -> list[dict]:
+        return [r for r in tables["trace_summary"] if (r["config"], r["arm"], r["points"]) == (config, arm, "decode:b1")]
+
+    steps: dict[int, list[float]] = {}
+    for s in tables["trace_steps"]:
+        if (s["config"], s["arm"], s["points"]) == ("TP2", "base", "decode:b1"):
+            steps.setdefault(s["rank"], []).append(s["gpu_busy_ms"])
+    rows = trace("TP2", "base")
+    busy = [statistics.fmean(steps[r["rank"]]) for r in rows]
+    assert [r["busy_ms"] for r in rows] == pytest.approx(busy) and busy[0] != busy[1]
+    untraced_ms = statistics.fmean(busy) / (1 - rows[0]["idle_est"])          # the step idle_est was computed with
+    assert [r["idle_rank"] for r in rows] == pytest.approx([1 - b / untraced_ms for b in busy])
+    assert statistics.fmean(r["idle_rank"] for r in rows) == pytest.approx(rows[0]["idle_est"])
+    [tp1] = trace("TP1", "base")
+    assert tp1["busy_ms"] > 0 and tp1["idle_rank"] == pytest.approx(tp1["idle_est"])       # one rank
+    assert all(r["busy_ms"] is None and r["idle_rank"] is None for r in trace("TP2", "AR3"))   # no trace.sqlite
 
 
 def test_gate_failed_traces_decide_no_hypothesis(tmp_path):
@@ -477,6 +533,21 @@ def test_summary_sections_watermark_and_gaps(records, tables, hyps, tmp_path):
     assert "above half of TP1's" in headline
     report.write_summary(tables, hyps, [], out, fake=False)
     assert "FAKE" not in pathlib.Path(out).read_text(encoding="utf-8").splitlines()[0]
+
+
+def test_traces_table_shows_busy_and_idle_by_rank(tables, hyps, tmp_path):
+    out = str(tmp_path / "SUMMARY.md")
+    report.write_summary(tables, hyps, [], out, fake=True)
+    section = pathlib.Path(out).read_text(encoding="utf-8").split("## Traces", 1)[1].split("\n## ", 1)[0]
+    lines = [[c.strip() for c in line.strip("|").split("|")] for line in section.splitlines() if line.startswith("|")]
+    cells = {tuple(row[:3]): dict(zip(lines[0], row)) for row in lines[2:]}
+    tp2 = [r for r in tables["trace_summary"] if (r["config"], r["arm"], r["points"]) == ("TP2", "base", "decode:b1")]
+    row = cells[("TP2", "base", "decode:b1")]
+    assert row["busy by rank (ms/step)"] == " / ".join(f"{r['busy_ms']:.3g}" for r in tp2)
+    assert row["idle by rank"] == " / ".join(f"{r['idle_rank']:.3g}" for r in tp2)
+    assert cells[("TP2", "AR3", "decode:b1")]["idle by rank"] == "n/a / n/a"       # no trace.sqlite
+    assert " / " not in cells[("TP1", "base", "decode:b1")]["busy by rank (ms/step)"]   # one rank
+    assert "idle_est is their mean" in section
 
 
 def test_unreadable_records_become_gaps_not_crashes(tmp_path):

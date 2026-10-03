@@ -168,7 +168,8 @@ def _write_outputs(spec: matrix.RunSpec, run_dir: str, engine: str, fi_backend: 
         _write_json(os.path.join(run_dir, "trace_summary.json"),
                     trace_summary(spec.config, spec.arm, str(spec.p("points"))))
         if (spec.config, spec.arm, str(spec.p("points"))) in sqlite_traces:
-            write_trace_sqlite(os.path.join(run_dir, "trace.sqlite"), spec.config, fi_backend,
+            write_trace_sqlite(os.path.join(run_dir, "trace.sqlite"), spec.config,
+                               _trace_ar_backend(spec.config, spec.arm, fi_backend),
                                int(str(spec.p("points")).split(":b")[1]))
     elif kind == "serve_session":
         write_session(run_dir, spec, sat_prompts, sweep_prompts, t)
@@ -253,10 +254,18 @@ def trace_summary(config: str, arm: str, points: str) -> dict:
             "idle_est": idle, "window_ns": [0, int(steps * step_ms * 1e6)], "launch_ts_missing": 0}
 
 
-def write_trace_sqlite(path: str, config: str, fi_backend: str, batch: int, steps: int = SQLITE_STEPS) -> None:
+def _trace_ar_backend(config: str, arm: str, fi_backend: str) -> str:
+    """The synth_trace all-reduce backend of an engine. G2 (--enforce-eager) runs no fusion pass: its all-reduce
+    kernel is unfused and the residual add + RMSNorm are standalone kernels, as in the 2026-10-02 G2 trace."""
+    if _tp(config) == 1:
+        return "none"
+    return "mnnvl_unfused" if arm == "G2" else fi_backend
+
+
+def write_trace_sqlite(path: str, config: str, ar_backend: str, batch: int, steps: int = SQLITE_STEPS) -> None:
     """A synthetic nsys export with `steps` pure decode steps per rank (TP2: 65 AR + 1 AG per step)."""
     tp = _tp(config)
-    ranks = [{"pid": 42420 + r, "device": r, "tp": tp, "ar_backend": fi_backend if tp == 2 else "none",
+    ranks = [{"pid": 42420 + r, "device": r, "tp": tp, "ar_backend": ar_backend,
               "batch": batch, "steps": [[0, 0, batch, batch]] * steps, "drop_last": 0} for r in range(tp)]
     synth_trace.build_trace_db(path, ranks, measure=synth_trace.trace_span(ranks))
 

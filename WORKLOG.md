@@ -165,6 +165,10 @@ share. Not explained yet: G1 (graphs off, fusion kept) also shows about
 11.1 x (1 - 0.208) = 8.8 ms of GPU busy time. Next step: compare kernel counts
 and categories between the base, G1 and G2 traces.
 
+**Correction (2026-10-03).** The paragraph above is wrong: eager mode does not
+do 2.6x the GPU work. The 10.3 and 8.8 ms are means over two ranks, one of
+which spin-waits in its all-reduce kernels. See the 2026-10-03 entry below.
+
 **H4 is a hit only through round 2.** The rule is range overlap: 12.31-18.04
 overlaps 13.92-15.30. Rounds 1 and 3, the median and the pooled value are
 2.4-3.6 ms above the band. Round 2's TP2 run at 29.66 req/s (seed 2003) had
@@ -176,7 +180,7 @@ model's s\* is 2.4-3.6 ms too low (median and pooled value vs the band's top).
 about 1.4 h was idle while nobody drove the session).
 
 **Open:**
-- [ ] G1's GPU busy time (above).
+- [x] G1's GPU busy time (above). (2026-10-03: rank 1 spin-waits in its all-reduce kernels, entry below)
 - [ ] Update the estimator for comm and trace runs.
 - [x] The a-posteriori fit: memory efficiency and fixed per-step time from TP1 only, α and β from M2 and M3; TP2 as an out-of-sample prediction. (2026-10-03, entry below)
 
@@ -251,6 +255,90 @@ M4 (nccl-tests, graph) gives 4.9 µs. M2 does transfer: 4.57 µs against 5.3-5.9
 keep their a-priori constants, so H3-H5 have no a-posteriori value.
 
 **Open:**
-- [ ] G1's GPU busy time.
 - [ ] Update the estimator for comm and trace runs.
 - [ ] An a-posteriori prefill fit (the a-priori model is 5.7 ms too low for TP1 at 512 tokens).
+
+## 2026-10-03: the H7 explanation was wrong, and G2's comm time was understated (no GPU)
+
+Both were found in the run records of 2026-10-02 while splitting TP2's gap by
+kernel category. Nothing was rerun.
+
+**Problem 1: the H7 explanation.** The 2026-10-02 entry said that eager mode
+does about 2.6x the GPU work per step (10.3 ms busy in G2 against 3.9 ms) and
+left G1's 8.8 ms open. The README repeated the 2.6x. Both figures are the mean
+of two ranks that are nothing alike. Decode batch 1, mean over the 255 pure
+decode steps (`results/tidy/trace_steps.csv` and `trace_summary.csv`):
+
+| per step | base | G1 | G2 |
+|---|---|---|---|
+| GPU busy, rank 0 / rank 1 (ms) | 3.92 / 3.92 | 4.08 / 13.51 | 4.15 / 16.50 |
+| of that in all-reduce kernels (ms) | 0.35 / 0.39 | 0.44 / 9.74 | 0.26 / 12.50 |
+| AR sync wait, AM16 (ms) | 0.14 | 9.55 | 12.27 |
+| untraced step (ms) | 4.08 | 11.11 | 13.80 |
+| idle by rank (1 - busy / untraced step) | 0.040 / 0.038 | 0.633 / -0.217 | 0.700 / -0.196 |
+| idle_est (their mean) | 0.039 | 0.208 | 0.252 |
+
+Rank 0 is busy for 4.08 ms (G1) and 4.15 ms (G2) per step, 4-6% more than in
+the baseline. That is the GPU work. Rank 1's other 9.4 and 12.4 ms are
+all-reduce kernel time.
+
+**What happens.** From the kernel start, end and launch times of the pure
+decode steps in the trace.sqlite of `P0-trace-TP2-base-r0-bbf7d5bb`,
+`P2-trace-TP2-G1-r0-faa4b0ea` and `P0-trace-TP2-G2-r0-a145952f` (values are
+G1 / G2):
+- Without a CUDA graph, each rank launches 442 / 506 kernels and copies per
+  step one by one. The baseline makes 26 launches per step.
+- Rank 0's kernels start on the GPU 0.03 / 0.01 ms after their launch. Its GPU
+  runs each kernel as soon as the CPU launches it and is idle in between.
+- Rank 1's CPU opens each step 13.0 / 15.6 ms before rank 0's, about one step
+  ahead. Its kernels start 13.5 / 15.7 ms after their launch: they are queued,
+  and its GPU gets to every all-reduce first.
+- An all-reduce kernel of rank 1 starts 143 / 190 µs before rank 0's and ends
+  within 1 µs of it (mean over 65 x 255 ops). It runs for 150 / 193 µs, against
+  7 / 4 µs on rank 0. In the baseline both ranks start within 1 µs and run for
+  5-6 µs.
+
+So the launch gaps that H7 predicted are there. On rank 0 they are idle time
+(0.63 and 0.70 of the step). On rank 1 they are spin-wait inside the all-reduce
+kernel, and the estimator counts that as busy: idle_est (AM16) is 1 - the mean
+busy time of the two ranks / the untraced step.
+
+The estimator has a second problem in these two arms. Busy time per step comes
+from the traced run and the step from the untraced one. The premise is that
+tracing does not change the busy time. A wait is not like that. It fills
+whatever the step leaves: rank 1 is busy for 96% and 97% of the traced window,
+and the traced step is 14.0 and 16.9 ms against 11.1 and 13.8 ms untraced.
+That is why rank 1's idle comes out negative.
+
+**H7 stays a miss.** The estimator and the thresholds were fixed before the
+run, and by them G2 is 0.252, not > 0.30. Only the explanation is withdrawn.
+The threshold was not wrong about the GPU work. The estimator does not see
+launch-gap idle time when one rank waits for the other inside a kernel.
+
+**Problem 2: G2's comm time.** `_comm_time` (AM16) subtracted TP1's
+`fused_add_rms_norm` time from the all-reduce time of every arm except
+AR1-AR3, because the fused all-reduce kernel also does that work.
+`--enforce-eager` runs no fusion pass. The G2 trace has the one-shot kernel
+without the norm (3.9 µs per op on rank 0, against 5.3 µs for the fused kernel
+in the baseline) and 64 standalone `fused_add_rms_norm_kernel` per step
+(0.17 ms). So SUMMARY subtracted 0.143 ms that the kernel never spent and
+showed 0.113 ms of comm per step for G2. It is 0.256 ms (rank 0).
+
+**Fix** (each with a test that failed first):
+- `_comm_time`: a TP2 trace whose own trace.sqlite has standalone norm kernels
+  is unfused, whatever the arm. G2 joins AR1-AR3 in the arm list, which still
+  decides for a trace without trace.sqlite.
+- `trace_summary` has `busy_ms` and `idle_rank` per rank, and SUMMARY's Traces
+  table shows both by rank, so the table above is regenerated with the report.
+- Regenerated from `raw/`: in `trace_summary.csv` the comm columns of the two
+  G2 rows changed and the two columns were added; SUMMARY changed in its Traces
+  section only. The other fourteen tidy files and the ten figures are
+  byte-identical.
+- README: the H7 sentences under the results table.
+
+**Lesson.** The 2.6x was computed from idle_est alone, as step x (1 - idle).
+The two ranks' busy times were already in `trace_steps.csv` that day, 4 ms and
+16 ms. Before explaining a mean, look at the rows it averages.
+
+**Open:**
+- [ ] Why rank 1's CPU runs one step ahead of rank 0's when graphs are off (not checked; it is 0.02 ms in the baseline).

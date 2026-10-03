@@ -271,15 +271,29 @@ def _gap(t: Tables) -> list[str]:
 
 def _traces(t: Tables) -> list[str]:
     out = ["## Traces", "", "Traced shares are fractions of the traced window; nsys step times are not headline "
-           "latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16). A trace that "
+           "latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16). Busy and idle "
+           "by rank are each rank's own busy time per step and 1 - that / the same untraced step; idle_est is their "
+           "mean. A GPU that spin-waits inside an all-reduce kernel for the other rank counts as busy (the AR sync "
+           "column). The busy time comes from the traced run, whose step is longer than the untraced one, so a "
+           "waiting rank's idle can be negative. A trace that "
            "fails the completeness gate is listed but decides no hypothesis (spec 4.5). TP2 comm = fused AR time "
-           "- TP1's per-step fused_add_rms_norm time (AM16); AR1-AR3 are unfused, so their AR time is comm. "
+           "- TP1's per-step fused_add_rms_norm time (AM16); AR1-AR3, G2 and any trace with standalone norm "
+           "kernels are unfused, so their AR time is comm. "
            "Per-step rows are in `tidy/trace_steps.csv`.", ""]
     rows = [r for r in t.get("trace_summary", []) if r.get("rank") == 0]
+    ranks: dict[str, list[dict]] = {}
+    for r in t.get("trace_summary", []):
+        ranks.setdefault(r["run_id"], []).append(r)
+
+    def by_rank(r: dict, key: str) -> str:
+        return " / ".join(_f(x.get(key), 3) for x in ranks[r["run_id"]])
+
     return out + _table(("config", "arm", "points", "gate", "steps", "AR/AG per step (mode)", "idle_est",
+                         "busy by rank (ms/step)", "idle by rank",
                          "unclassified", "AR wire / sync (ms/step)", "AR / TP1 norm / comm (ms/step)", "run"),
                         ((r["config"], r["arm"], r["points"], "ok" if r["gate_ok"] else f"FAIL: {r['gate_reasons']}",
                           r["steps"], f"{r['ar_mode']} / {r['ag_mode']}", _f(r["idle_est"], 3),
+                          by_rank(r, "busy_ms"), by_rank(r, "idle_rank"),
                           _f(r["unclassified_frac"], 3), f"{_f(r['ar_wire_ms'], 3)} / {_f(r['ar_sync_ms'], 3)}",
                           (f"{_f(r.get('ar_ms'), 3)} / {_f(r.get('tp1_norm_ms'), 3)} / {_f(r.get('comm_ms'), 3)}"
                            + (f" ({r['comm_note']})" if r.get("comm_ms") is None and r.get("comm_note") else ""))

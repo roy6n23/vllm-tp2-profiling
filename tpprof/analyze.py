@@ -55,7 +55,9 @@ H6_MIN_EXACT = 0.99          # spec 4.8: exact 65 AR / 1 AG in >= 99% of steps
 H7_BASE_MAX, H7_G2_MIN = 0.10, 0.30
 # AM16: vLLM's standalone residual-add + RMSNorm kernel (vllm::fused_add_rms_norm_kernel, kernel_names.tsv).
 FUSED_ADD_RMS_NORM = re.compile(r"fused_add_rms_norm")
-UNFUSED_AR_ARMS = ("AR1", "AR2", "AR3")      # spec 4.7: the RMSNorm is not fused into the all-reduce
+# Arms whose all-reduce kernels do not also do the residual add + RMSNorm: AR1-AR3 by design (spec 4.7), G2
+# because --enforce-eager skips torch.compile and with it the fusion pass.
+UNFUSED_AR_ARMS = ("AR1", "AR2", "AR3", "G2")
 N_BOOT = 2000
 S_STAR_BOOT = 500
 MAX_EVIDENCE_PATHS = 3
@@ -973,16 +975,18 @@ def _traces(runs: Sequence[Run], gaps: _Gaps) -> tuple[list[dict], list[dict]]:
                 if steps is not None:
                     row.update(h6_source="trace.sqlite", h6_steps=len(steps),
                                ar_ms=_stat_mean(steps, "cat_all_reduce_ms"), ar_ms_source="trace.sqlite",
-                               fused_add_rms_norm_ms=_stat_mean(steps, "fused_add_rms_norm_ms"))
+                               fused_add_rms_norm_ms=_stat_mean(steps, "fused_add_rms_norm_ms"),
+                               busy_ms=_stat_mean(steps, "gpu_busy_ms"))
                     row.update(h6_bounds(row, sum(s["exact_counts"] for s in steps)))
                     for s in steps:
                         step_rows.append({"run_id": run.run_id, "config": run.config, "arm": run.arm, "tp": tp,
                                           "points": run.p("points"), "gate_ok": gate_ok, "rank": row["rank"], **s})
                 else:
                     row.update(h6_source="summary", h6_steps=row["steps"], ar_ms=row["cat_all_reduce_ms"],
-                               ar_ms_source="summary shares", fused_add_rms_norm_ms=None)
+                               ar_ms_source="summary shares", fused_add_rms_norm_ms=None, busy_ms=None)
                     row.update(h6_bounds(row, None))
                 run_rows.append(row)
+            _rank_idle(run_rows)
             rows += run_rows
         except _PARSE_ERRORS as e:
             gaps.add("unreadable", f"trace_summary.json: {e}", run)
@@ -990,13 +994,27 @@ def _traces(runs: Sequence[Run], gaps: _Gaps) -> tuple[list[dict], list[dict]]:
     return rows, step_rows
 
 
+def _rank_idle(run_rows: Sequence[dict]) -> None:
+    """idle_rank = 1 - a rank's own traced busy time per step / the untraced step. idle_est (AM16) is the same
+    with the mean busy time of the ranks, so it is the mean of their idle_rank, and the untraced step it was
+    computed with is that mean busy time / (1 - idle_est). A GPU that spin-waits inside an all-reduce kernel for
+    the other rank counts as busy. The busy time comes from the traced run, whose step is longer than the
+    untraced one, so a waiting rank's idle_rank can be negative."""
+    busy = [r["busy_ms"] for r in run_rows]
+    idle = run_rows[0]["idle_est"] if run_rows else None
+    known = idle is not None and None not in busy and sum(busy) > 0
+    for r in run_rows:
+        r["idle_rank"] = 1 - (1 - idle) * r["busy_ms"] / float(np.mean(busy)) if known else None
+
+
 def _comm_time(rows: Sequence[dict]) -> None:
     """AM16: TP2 comm time per step = fused AR time - TP1's per-step fused_add_rms_norm time.
 
-    The default path (base, G1, G2) fuses residual add + RMSNorm into the all-reduce kernel; TP1 runs that
-    work as standalone fused_add_rms_norm kernels, so their time is subtracted. AR1-AR3 run the RMSNorm as its
-    own kernel, so their AR time is comm time as it stands. The TP1 reference is a gate-passing TP1 trace at
-    the same points (same arm, else base), rank 0, counted from its trace.sqlite."""
+    The default path (base, G1) fuses residual add + RMSNorm into the all-reduce kernel; TP1 runs that work as
+    standalone fused_add_rms_norm kernels, so their time is subtracted. An unfused path runs the RMSNorm as its
+    own kernel, so its AR time is comm time as it stands. A trace is unfused when its arm is (UNFUSED_AR_ARMS)
+    or when its own trace.sqlite has standalone fused_add_rms_norm kernels, whatever the arm. The TP1 reference
+    is a gate-passing TP1 trace at the same points (same arm, else base), rank 0, counted from its trace.sqlite."""
     tp1 = {}
     for r in rows:
         if r["config"] == "TP1" and r["gate_ok"] and r["rank"] == 0 and r.get("fused_add_rms_norm_ms") is not None:
@@ -1005,14 +1023,16 @@ def _comm_time(rows: Sequence[dict]) -> None:
         r.update(ar_fused=None, tp1_norm_ms=None, comm_ms=None, comm_note=None)
         if r["tp"] != 2:
             continue
-        fused = r["arm"] not in UNFUSED_AR_ARMS
+        unfused_arm = r["arm"] in UNFUSED_AR_ARMS
+        fused = not unfused_arm and not r.get("fused_add_rms_norm_ms")
         r["ar_fused"] = fused
         if not r["gate_ok"]:
             r["comm_note"] = "completeness gate failed"
         elif r["ar_ms"] is None:
             r["comm_note"] = "no all-reduce time"
         elif not fused:
-            r.update(comm_ms=r["ar_ms"], comm_note="unfused path: the AR kernels are comm only")
+            r.update(comm_ms=r["ar_ms"], comm_note=("unfused path" if unfused_arm else "standalone norm kernels in "
+                                                    "the trace") + ": the AR kernels are comm only")
         else:
             ref = tp1.get((r["arm"], r["points"])) or tp1.get(("base", r["points"]))
             if ref is None:
