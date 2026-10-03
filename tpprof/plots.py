@@ -15,7 +15,7 @@ from tpprof.constants import PREFILL_LENS, TTFT_SLO_S
 DPI = 150
 FIGURES = ("decode_step_vs_batch.png", "efficiency_vs_tokens.png", "ttft_tpot_vs_rate.png", "throughput_vs_rate.png",
            "goodput_vs_slo.png", "allreduce_latency_vs_size.png", "trace_breakdown.png", "ar_ladder.png",
-           "graphs_ablation.png")
+           "graphs_ablation.png", "tp2_gap_waterfall.png")
 ONLINE_CONFIGS = ("TP1", "TP2", "DP2", "DP2rand")
 DECODE_MARK_TOKENS = (1, 32, 128)          # AR message sizes marked on the all-reduce figure: 8 KiB x tokens
 AR_LADDER = ("base", "AR1", "AR2", "AR3")
@@ -63,6 +63,12 @@ def _decode_step_vs_batch(plt, t: Tables, ax) -> bool:
             ax.plot(mx, my, "--", color=line.get_color(), label=f"{label} model (central)")
             if len(lo) == len(mx) == len(hi):
                 ax.fill_between(mx, lo, hi, color=line.get_color(), alpha=0.15)
+        post = [r for r in t.get("posteriori", []) if r.get("row") == "point" and r.get("arm") == "base"
+                and r.get("config") == config]
+        px, py = _median_by(post, "batch", "posteriori_ms")
+        if px:
+            how = "fitted" if post[0].get("sample") == "in" else "out of sample"
+            ax.plot(px, py, ":", color=line.get_color(), label=f"{label} a posteriori ({how})")
         drawn = True
     ax.set_xscale("log", base=2)
     ax.set_xlabel("batch (sequences)")
@@ -228,6 +234,44 @@ def _graphs_ablation(plt, t: Tables, ax) -> bool:
     return _arm_bars(plt, t, ax, ("TP1", "TP2"), GRAPH_ARMS, "CUDA-graph arms: decode step (G2 = eager)")
 
 
+def _tp2_gap_waterfall(plt, t: Tables, ax) -> bool:
+    """Horizontal waterfall of the smallest traced batch: half of TP1's step, one bar per component's excess
+    (largest first), then TP2's measured step."""
+    rows = t.get("tp2_gap", [])
+    if not rows:
+        return False
+    batch = min(r["batch"] for r in rows)
+    step = next(r for r in rows if r["batch"] == batch and r["component"] == "step")
+    parts = sorted((r for r in rows if r["batch"] == batch and r["component"] != "step"),
+                   key=lambda r: -r["excess_ms"])
+    ax.figure.set_size_inches(9, 4.6)
+    half, tp2 = step["half_tp1_ms"], step["tp2_ms"]
+    labels = [f"half of TP1's step ({step['tp1_ms']:.2f} ms / 2)"]
+    ax.barh(0, half, color="0.6")
+    ax.text(half / 2, 0, f"{half:.2f} ms: what 2x would be", va="center", ha="center", fontsize=8, color="white")
+    left = half
+    for i, r in enumerate(parts, start=1):
+        x = r["excess_ms"]
+        ax.barh(i, x, left=left, color="tab:orange" if x >= 0 else "tab:green")
+        ax.plot([left, left], [i - 1, i], color="0.4", lw=0.6, ls=":")
+        share = "" if r["share"] is None else f" ({r['share']:.0%})"
+        ax.text(max(left, left + x) + 0.03, i, f"{x:+.3f} ms{share}", va="center", fontsize=8)
+        labels.append(f"+ {r['label']}")
+        left += x
+    n = len(parts) + 1
+    ax.plot([left, left], [n - 1, n], color="0.4", lw=0.6, ls=":")
+    ax.barh(n, tp2, color="tab:blue")
+    ax.text(tp2 / 2, n, f"{tp2:.2f} ms measured", va="center", ha="center", fontsize=8, color="white")
+    labels.append("TP2's step")
+    ax.set_yticks(range(n + 1))
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlim(0, max(tp2, left) * 1.2)
+    ax.set_xlabel(f"decode step time (ms); in brackets: share of the {step['excess_ms']:.2f} ms gap")
+    ax.set_title(f"Why TP=2 is {step['tp1_ms'] / tp2:.2f}x and not 2x: decode step, batch {batch}", fontsize=10)
+    return True
+
+
 _DRAW: dict[str, tuple[Callable, int]] = {
     "decode_step_vs_batch.png": (_decode_step_vs_batch, 1),
     "efficiency_vs_tokens.png": (_efficiency_vs_tokens, 1),
@@ -238,6 +282,7 @@ _DRAW: dict[str, tuple[Callable, int]] = {
     "trace_breakdown.png": (_trace_breakdown, 2),
     "ar_ladder.png": (_ar_ladder, 1),
     "graphs_ablation.png": (_graphs_ablation, 1),
+    "tp2_gap_waterfall.png": (_tp2_gap_waterfall, 1),
 }
 
 

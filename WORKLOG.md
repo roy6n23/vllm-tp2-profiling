@@ -115,7 +115,7 @@ merge; the fix rounds are in the git history.
 - [x] TP1 decode batch 1 on GPU1 vs GPU0 (the DP2 derivation is flagged if they differ by ≥ 1%). (0.40%)
 - [x] The offline driver vs `vllm bench latency` cross-check at batch 8 (within 3% expected). (TP1 -0.01%, TP2 +2.02%)
 - [ ] Estimated vs actual wall time per tier; update the estimator if it is off. (P0 0.7 h vs 1.3 h estimated, P1 2.2 vs 2.3, P2 1.2 vs 2.1: comm and trace runs are overestimated; estimator not updated yet)
-- [ ] The a-posteriori fit: memory efficiency and fixed per-step time from TP1 only, α and β from M2 and M3; TP2 as an out-of-sample prediction.
+- [x] The a-posteriori fit: memory efficiency and fixed per-step time from TP1 only, α and β from M2 and M3; TP2 as an out-of-sample prediction. (2026-10-03, entry below)
 - [x] Mark H1–H8 hit or miss against `predictions.md`, with one entry here per miss. (H5 and H7 missed, entry below)
 - [x] Fill in the evidence paths of the confounder ledger. (results/SUMMARY.md, "Confounder evidence")
 
@@ -178,4 +178,79 @@ about 1.4 h was idle while nobody drove the session).
 **Open:**
 - [ ] G1's GPU busy time (above).
 - [ ] Update the estimator for comm and trace runs.
-- [ ] The a-posteriori fit: memory efficiency and fixed per-step time from TP1 only, α and β from M2 and M3; TP2 as an out-of-sample prediction.
+- [x] The a-posteriori fit: memory efficiency and fixed per-step time from TP1 only, α and β from M2 and M3; TP2 as an out-of-sample prediction. (2026-10-03, entry below)
+
+## 2026-10-03: the a-posteriori fit and the split of TP2's gap (no GPU)
+
+Both come from the run records of 2026-10-02; nothing was rerun. `python -m tpprof
+report` now also writes `tidy/posteriori.csv`, `tidy/tp2_gap.csv`, two sections of
+SUMMARY.md and `figures/tp2_gap_waterfall.png` (`tpprof/posteriori.py`,
+`tpprof/gap.py`). The thirteen tidy files that existed before are byte-identical.
+
+**The fit (spec 5.1).** Step time against the bytes a step reads, least squares
+over the eight TP1 decode batches:
+
+| constant | a priori | a posteriori | from |
+|---|---|---|---|
+| effective bandwidth | 3.0 TB/s | 2.69 TB/s (80% of the 3.352 TB/s peak) | TP1 slope |
+| fixed time per step | 0.8 ms | 0.69 ms | TP1 intercept |
+| TP2 extra per step | 0.1 ms | 0 | not fittable from TP1, so it is left in the residual |
+| α, β fused all-reduce | 5 µs, 260 GB/s | 4.57 µs, 185 GB/s | M2, mnnvl one-shot |
+| α, β pure NCCL (graph) | 6 µs, 260 GB/s | 12.5 µs, 312 GB/s | M3, default variant |
+
+M2's one-shot row is the right one for decode: the traces show
+`oneshotAllreduceFusionKernel` at batch 1 and 32, and the two-shot kernel only in
+prefill steps. Batch 128 was not traced.
+
+**Residuals.** TP1 (in sample) is within 0.8% at every batch. TP2 (out of sample)
+is measured slower than predicted at every batch: +0.27, +0.24, +0.15, +0.14,
++0.26, +0.27, +0.29, +0.08 ms for batch 1 to 128 (0.9-6.5%). So the model's form
+fits one GPU, and a TP1-calibrated model is about a quarter of a millisecond too
+optimistic about TP2.
+
+**H1 was a hit with cancelling errors.** The a-priori step times at batch 1 were
+6.9% (TP1) and 7.7% (TP2) too low, and the ratio came out at 1.555 against a
+measured 1.542. With TP1 calibrated the same model predicts 1.657, which is
+further from the measurement. The a-priori fixed time (0.8 ms, plus 0.1 ms for
+TP2) was too large for TP1 and happened to stand in for the costs below.
+
+**Where the residual is (the gap table).** At batch 1, TP2's step is 0.933 ms
+above half of TP1's. From the traces, per step: GEMM +0.276, all-reduce and
+all-gather +0.231, attention +0.194, norm/residual/RoPE/activation +0.157, not
+on the GPU +0.056, sampling/copies/other +0.019. The model halves every byte
+that is read, and that is where it is wrong:
+
+- GEMM takes 2.933 ms for half the bytes that take 5.313 ms on one GPU (55%).
+  Grouping the kernels of the pure decode steps by name (trace.sqlite of
+  `P0-trace-TP1-base-r0-2d7e12bf` and `P0-trace-TP2-base-r0-bbf7d5bb`, rank 0):
+  the largest per-layer GEMV goes from 77.6 to 41.5 µs (1.87x), the other three
+  together from 74.1 to 41.6 µs (1.78x), the lm_head from 348 to 181 µs (1.92x),
+  and the 64 split-K reduce kernels per step take 0.11 ms at both TP degrees.
+  The smaller the matrix, the further from 2x.
+- Attention is 0.413 ms on one GPU and 0.400 ms per rank with TP2. At batch 32
+  it does shrink (2.010 to 1.220 ms, 1.65x).
+- Norm work is replicated: 0.319 ms on TP1, 0.317 ms on TP2 once the 0.143 ms
+  that the fused all-reduce kernel does is counted as norm work (AM16).
+
+**Limits of the gap table.** Kernel times come from traced runs and step totals
+from untraced ones. At batch 1 the traced runs' median step is within 0.6% (TP1)
+and 1.8% (TP2) of the untraced median, so the "not on the GPU" row carries up
+to about 0.07 ms of that difference. At batch 32 the ratios are 0.980 and 1.040,
+which is up to 0.2 ms; its "not on the GPU" row is -0.088 ms and means nothing
+beyond that mismatch. The batch-32 kernel rows have the same few percent of
+uncertainty.
+
+**AR3: M3's α does not transfer.** The fit predicts AR3 within -1.3% to +3.9%
+(batch 1, 32, 128), but the AR3 - baseline difference at batch 1 is predicted at
+0.68 ms and measured at 0.36 ms. M3's graph-mode loop gives 12.5 µs per
+all-reduce; in the AR3 trace the NCCL all-reduce kernels take 6.8 µs per op, and
+M4 (nccl-tests, graph) gives 4.9 µs. M2 does transfer: 4.57 µs against 5.3-5.9
+µs per fused kernel in the baseline trace.
+
+**Not refitted.** Prefill (the FLOP rates), KV capacity and the saturation model
+keep their a-priori constants, so H3-H5 have no a-posteriori value.
+
+**Open:**
+- [ ] G1's GPU busy time.
+- [ ] Update the estimator for comm and trace runs.
+- [ ] An a-posteriori prefill fit (the a-priori model is 5.7 ms too low for TP1 at 512 tokens).

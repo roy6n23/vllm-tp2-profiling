@@ -11,10 +11,10 @@ import sys
 import pytest
 
 from tests import make_records
-from tpprof import analyze, kernels, model, plots, report
+from tpprof import analyze, gap, kernels, model, plots, report
 
 CSV_TABLES = ("offline_points", "online_runs", "saturation", "goodput", "s_star", "comm", "kv_capacity",
-              "trace_summary")
+              "trace_summary", "posteriori", "tp2_gap")
 HYP_IDS = tuple(f"H{i}" for i in range(1, 9))
 WATERMARK = "> FAKE DATA — dry run with fake tools; numbers are meaningless"
 
@@ -247,6 +247,43 @@ def test_trace_steps_and_am16_comm_time(records, tables):
     assert rows[("TP1", "base", "decode:b1", 0)]["comm_ms"] is None
 
 
+def test_posteriori_table_refits_tp1_and_predicts_tp2(records, tables):
+    rows = tables["posteriori"]
+    c = {r["name"]: r for r in rows if r["row"] == "constant"}
+    # make_records draws every step time from the central model, so the TP1 fit returns its constants.
+    assert c["bw_eff"]["value"] == pytest.approx(make_records.C.bw_eff, rel=1e-6)
+    assert c["t_fixed"]["value"] == pytest.approx(make_records.C.t_fixed, rel=1e-6)
+    assert c["alpha"]["value"] == pytest.approx(5e-6, rel=0.05)              # M2 of the engines' backend (trtllm)
+    assert "flashinfer_trtllm_fused_allreduce_rmsnorm_oneshot" in c["alpha"]["source"]
+    assert c["alpha_nccl_graph"]["value"] == pytest.approx(6e-6, rel=0.1)   # M3, graph, default variant
+    points = {(r["config"], r["arm"], r["batch"]): r for r in rows if r["row"] == "point"}
+    assert {k[:2] for k in points} == {("TP1", "base"), ("TP2", "base"), ("TP2", "AR3")}
+    assert points[("TP1", "base", 1)]["residual_ms"] == pytest.approx(0.0, abs=1e-6)
+    # The central model gives TP2 an extra 0.1 ms per step; the stage sets that term to 0, so it is the residual.
+    assert points[("TP2", "base", 1)]["residual_ms"] == pytest.approx(make_records.C.t_extra_tp2 * 1e3, abs=0.01)
+    assert len(_read_csv(os.path.join(records, "tidy", "posteriori.csv"))) == len(rows)
+
+
+def test_tp2_gap_table_splits_the_traced_batch(records, tables):
+    rows = tables["tp2_gap"]
+    assert {r["batch"] for r in rows} == {1}                                  # SQLITE_TRACES: decode:b1 only
+    assert [r["component"] for r in rows] == ["step", *gap.COMPONENTS]
+    step, parts = rows[0], rows[1:]
+    assert step["tp1_ms"] == pytest.approx(make_records._decode_step("TP1", "base", 1) * 1e3)
+    assert step["tp2_ms"] == pytest.approx(make_records._decode_step("TP2", "base", 1) * 1e3)
+    assert step["excess_ms"] == pytest.approx(step["tp2_ms"] - step["tp1_ms"] / 2)
+    assert sum(r["excess_ms"] for r in parts) == pytest.approx(step["excess_ms"])
+    by = {r["component"]: r for r in parts}
+    # The same AM16 subtraction as trace_summary's comm_ms (mean of the two ranks), plus the 9 us all-gather.
+    am16 = [r["comm_ms"] for r in tables["trace_summary"]
+            if (r["config"], r["arm"], r["points"]) == ("TP2", "base", "decode:b1")]
+    assert by["comm"]["tp1_ms"] == 0.0
+    assert by["comm"]["tp2_ms"] == pytest.approx(sum(am16) / 2 + 9_000 / 1e6)
+    tp1_norm = 65 * 2_500 / 1e6                                               # tests/synth_trace.py
+    assert by["norm_act_rope"]["tp2_ms"] - tp1_norm == pytest.approx(by["norm_act_rope"]["tp1_ms"] - tp1_norm)
+    assert by["gemm"]["tp2_ms"] == pytest.approx(by["gemm"]["tp1_ms"] / 2, rel=0.01)   # synthetic GEMMs halve
+
+
 def test_gate_failed_traces_decide_no_hypothesis(tmp_path):
     """Spec 4.5: a trace is valid only if the completeness gate holds."""
     pred = model.predictions()
@@ -420,8 +457,9 @@ def test_summary_sections_watermark_and_gaps(records, tables, hyps, tmp_path):
     report.write_summary(tables, hyps, [str(tmp_path / "figures" / "x.png")], out, fake=True)
     text = pathlib.Path(out).read_text(encoding="utf-8")
     assert text.splitlines()[0] == WATERMARK
-    for section in ("## Hypotheses", "## Headline", "## Offline", "## Online", "## Communication", "## Traces",
-                    "## KV capacity", "## Confounder evidence", "## Gaps"):
+    for section in ("## Hypotheses", "## Headline", "## Offline", "## Online", "## Communication",
+                    "## A-posteriori fit", "## Traces", "## Why TP2 is not 2x", "## KV capacity",
+                    "## Confounder evidence", "## Gaps"):
         assert section in text, section
     hyp_section = text.split("## Hypotheses", 1)[1].split("\n## ", 1)[0]
     assert sum(1 for line in hyp_section.splitlines() if line.startswith("| H")) == 8
@@ -431,6 +469,12 @@ def test_summary_sections_watermark_and_gaps(records, tables, hyps, tmp_path):
     confounders = text.split("## Confounder evidence", 1)[1].split("\n## ", 1)[0]
     assert sum(1 for line in confounders.splitlines() if line[:3].strip("| ").isdigit()) == 18
     assert "raw/" in confounders and "effective_config.json" in confounders
+    fit = text.split("## A-posteriori fit", 1)[1].split("\n## ", 1)[0]
+    assert "| bw_eff |" in fit and "| TP2 | AR3 |" in fit and "out of sample" in fit
+    why = text.split("## Why TP2 is not 2x", 1)[1].split("\n## ", 1)[0]
+    assert "### Batch 1" in why and "| all-reduce and all-gather |" in why and "Traced / untraced step" in why
+    headline = text.split("## Headline", 1)[1].split("\n## ", 1)[0]
+    assert "above half of TP1's" in headline
     report.write_summary(tables, hyps, [], out, fake=False)
     assert "FAKE" not in pathlib.Path(out).read_text(encoding="utf-8").splitlines()[0]
 
@@ -476,6 +520,15 @@ def test_split_dp2rand_results_are_merged(tmp_path):
     assert row["completed"] == 40 and row["valid"]
 
 
+def test_fit_and_gap_sections_without_data_say_so_once(tmp_path):
+    out = str(tmp_path / "SUMMARY.md")
+    report.write_summary(_tables_with(), [], [], out, fake=False)
+    text = pathlib.Path(out).read_text(encoding="utf-8")
+    for section in ("## A-posteriori fit", "## Why TP2 is not 2x"):
+        body = text.split(section, 1)[1].split("\n## ", 1)[0]
+        assert body.count("(no data)") == 1 and "###" not in body, section
+
+
 def test_report_end_to_end_detects_fake(tmp_path):
     pytest.importorskip("matplotlib")
     d = _small(tmp_path)
@@ -494,7 +547,8 @@ def test_make_figures_writes_pngs(tables, tmp_path):
     names = {os.path.basename(p) for p in paths}
     assert len(paths) >= 5
     assert names <= set(plots.FIGURES)
-    assert {"decode_step_vs_batch.png", "goodput_vs_slo.png", "allreduce_latency_vs_size.png"} <= names
+    assert {"decode_step_vs_batch.png", "goodput_vs_slo.png", "allreduce_latency_vs_size.png",
+            "tp2_gap_waterfall.png"} <= names
     for p in paths:
         with open(p, "rb") as f:
             assert f.read(8) == b"\x89PNG\r\n\x1a\n"

@@ -1,5 +1,6 @@
-"""SUMMARY.md: hypothesis verdicts, headline numbers, the tables, confounder evidence and every gap
-(spec 7.6, 1.3 S6/S7). write_summary only formats the tables that analyze() built.
+"""SUMMARY.md: hypothesis verdicts, headline numbers, the tables, the a-posteriori fit, the split of TP2's gap
+to half of TP1, confounder evidence and every gap (spec 7.6, 1.3 S6/S7). write_summary only formats the tables
+that analyze() built.
 """
 from __future__ import annotations
 
@@ -98,6 +99,15 @@ def _headline(t: Tables, hyps: Sequence[dict]) -> list[str]:
     h3 = next((h for h in hyps if h["id"] == "H3"), None)
     if h3 is not None:
         out.append(f"- DP2 / TP2 saturation throughput: {_measured(h3['measured'])} (H3 {h3['verdict']})")
+    gap_rows = t.get("tp2_gap", [])
+    if gap_rows:
+        b = min(r["batch"] for r in gap_rows)
+        step = next(r for r in gap_rows if r["batch"] == b and r["component"] == "step")
+        parts = sorted((r for r in gap_rows if r["batch"] == b and r["component"] != "step"),
+                       key=lambda r: -r["excess_ms"])
+        out.append(f"- TP2's batch-{b} decode step is {step['excess_ms']:.3f} ms above half of TP1's "
+                   f"({step['tp2_ms']:.3f} vs {step['half_tp1_ms']:.3f} ms). By kernel category: "
+                   + ", ".join(f"{r['label']} {r['excess_ms']:+.3f}" for r in parts) + " ms.")
     return out + [""]
 
 
@@ -194,6 +204,71 @@ def _communication(t: Tables) -> list[str]:
                           _f(r["alpha_us"]), _f(r["beta_GBps"])) for r in fits))
 
 
+# name -> (factor, unit) the constants table shows
+_CONSTANT_DISPLAY = {"bw_eff": (1e-12, "TB/s"), "t_fixed": (1e3, "ms"), "t_extra_tp2": (1e3, "ms"),
+                     "alpha": (1e6, "us"), "beta": (1e-9, "GB/s"), "alpha_nccl_graph": (1e6, "us"),
+                     "beta_nccl": (1e-9, "GB/s")}
+
+
+def _posteriori(t: Tables) -> list[str]:
+    out = ["## A-posteriori fit", "",
+           "The decode model of `predictions.md` with the constants that can be measured without a TP2 engine "
+           "refitted (spec 5.1): `bw_eff` and `t_fixed` are the slope and intercept of the TP1 step time against "
+           "the bytes a step reads; alpha and beta come from the all-reduce microbenchmarks; `t_extra_tp2` is set "
+           "to 0. TP2 is then predicted out of sample, and residual = measured - a posteriori is what a "
+           "TP1-calibrated model does not explain.", ""]
+    rows = t.get("posteriori", [])
+    if not rows:
+        return out + ["(no data)", ""]
+    constants = []
+    for r in rows:
+        if r.get("row") == "constant":
+            k, unit = _CONSTANT_DISPLAY.get(r["name"], (1.0, r.get("unit") or ""))
+            constants.append((r["name"], _f(r["apriori"] * k), _f(r["value"] * k), unit, r["source"]))
+    out += _table(("constant", "a priori (central)", "a posteriori", "unit", "source"), constants)
+    points = [r for r in rows if r.get("row") == "point"]
+    out += ["### Decode step (ms)", ""]
+    out += _table(("config", "arm", "batch", "sample", "measured", "a priori", "a posteriori", "residual (ms)",
+                   "residual"),
+                  ((r["config"], r["arm"], r["batch"], r["sample"], f"{r['measured_ms']:.3f}",
+                    f"{r['apriori_ms']:.3f}", f"{r['posteriori_ms']:.3f}", f"{r['residual_ms']:+.3f}",
+                    f"{r['residual_frac']:+.1%}") for r in points))
+    by = {(r["config"], r["arm"], r["batch"]): r for r in points}
+    speedups = []
+    for b in sorted({k[2] for k in by}):
+        tp1, tp2 = by.get(("TP1", "base", b)), by.get(("TP2", "base", b))
+        if tp1 and tp2:
+            speedups.append((b, *(f"{tp1[k] / tp2[k]:.3f}" for k in ("measured_ms", "apriori_ms", "posteriori_ms"))))
+    out += ["### TP2 decode speedup over TP1", ""]
+    return out + _table(("batch", "measured", "a priori", "a posteriori"), speedups)
+
+
+def _gap(t: Tables) -> list[str]:
+    out = ["## Why TP2 is not 2x", "",
+           "Per decode step, by kernel category: the mean over the pure decode steps of the baseline traces (TP2: "
+           "also the mean of the two ranks). The step totals are the untraced medians, and \"not on the GPU\" is "
+           "what the kernels leave of the step. Excess = TP2 - TP1 / 2; the excesses add up to the gap. The fused "
+           "all-reduce kernel also does TP1's standalone residual add + RMSNorm; that time is counted as norm "
+           "work, not as communication (AM16). The kernel times come from traced runs, whose step time differs "
+           "from the untraced median by the ratio under each table; \"not on the GPU\" absorbs that difference. "
+           "Rows are in `tidy/tp2_gap.csv`.", ""]
+    rows = t.get("tp2_gap", [])
+    if not rows:
+        return out + ["(no data)", ""]
+    for b in sorted({r["batch"] for r in rows}):
+        step = next(r for r in rows if r["batch"] == b and r["component"] == "step")
+        out += [f"### Batch {b}: TP1 {step['tp1_ms']:.3f} ms, half of it {step['half_tp1_ms']:.3f} ms, TP2 "
+                f"{step['tp2_ms']:.3f} ms (gap {step['excess_ms']:.3f} ms, speedup "
+                f"{step['tp1_ms'] / step['tp2_ms']:.2f}x)", ""]
+        out += _table(("component", "TP1 (ms)", "TP1 / 2 (ms)", "TP2 (ms)", "excess (ms)", "share of gap"),
+                      ((r["label"], f"{r['tp1_ms']:.3f}", f"{r['half_tp1_ms']:.3f}", f"{r['tp2_ms']:.3f}",
+                        f"{r['excess_ms']:+.3f}", "n/a" if r["share"] is None else f"{r['share']:+.0%}")
+                       for r in rows if r["batch"] == b and r["component"] != "step"))
+        out += [f"Traced / untraced step: TP1 {step['tp1_traced_over_untraced']:.3f}, TP2 "
+                f"{step['tp2_traced_over_untraced']:.3f}.", ""]
+    return out
+
+
 def _traces(t: Tables) -> list[str]:
     out = ["## Traces", "", "Traced shares are fractions of the traced window; nsys step times are not headline "
            "latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16). A trace that "
@@ -264,7 +339,9 @@ def write_summary(tables: Tables, hyps: Sequence[dict], figures: Sequence[str], 
     lines += _offline(tables)
     lines += _online(tables)
     lines += _communication(tables)
+    lines += _posteriori(tables)
     lines += _traces(tables)
+    lines += _gap(tables)
     lines += _kv(tables)
     lines += _figures(figures, out_dir)
     lines += _confounders(tables)

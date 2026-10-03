@@ -13,6 +13,17 @@ tidy CSVs, figures and a hypothesis report.
 > [`results-2026-10-02` release](https://github.com/roy6n23/vllm-tp2-profiling/releases/tag/results-2026-10-02).
 > The predictions were committed beforehand ([predictions.md](predictions.md), tag `predictions-v1`).
 
+![Why TP=2 is 1.54x and not 2x: the decode step at batch 1, split by kernel category](results/figures/tp2_gap_waterfall.png)
+
+**The answer in three lines.**
+
+- At batch 1 a decode step takes 6.29 ms on one GPU and 4.08 ms with TP=2: 1.54×, not 2×.
+- Communication is a quarter of the missing 0.93 ms (65 all-reduces + 1 all-gather, 0.23 ms). GEMM time does
+  not halve when the weights do (+0.28 ms), and the per-layer attention and norm kernels take the same time
+  at both TP degrees (+0.35 ms together).
+- TP=2 still gets more goodput out of two GPUs than two replicas do when the TPOT SLO is below about
+  17.7 ms (12.3–18.0 ms over three rounds). Above that, the replicas win.
+
 ## The question
 
 Llama-3.1-8B-Instruct in bf16 (16.06 GB of weights) fits on one H100 80GB.
@@ -62,6 +73,55 @@ The misses are explained in [WORKLOG](WORKLOG.md) (2026-10-02): H5's model
 overstated non-KV memory and gave TP2 more of it than TP1 (measured 2.40 vs
 2.51 GiB per GPU); H7's threshold assumed eager mode only adds launch gaps,
 but it also roughly 2.6× the GPU work per step.
+
+**Why TP2 is not 2× (decode, batch 1).** Per step, from the traces: the mean over
+255 pure decode steps of the kernels in each category, TP2 averaged over its two
+ranks. The step totals are the untraced medians. The traced runs' own step times
+are within 0.6% (TP1) and 1.8% (TP2) of them.
+
+| per step (ms) | TP1 | TP1 / 2 | TP2 | TP2 − TP1 / 2 | share of the gap |
+|---|---|---|---|---|---|
+| GEMM (weights) | 5.313 | 2.657 | 2.933 | +0.276 | 30% |
+| all-reduce and all-gather | 0 | 0 | 0.231 | +0.231 | 25% |
+| attention | 0.413 | 0.206 | 0.400 | +0.194 | 21% |
+| norm, residual, RoPE, activation | 0.319 | 0.160 | 0.317 | +0.157 | 17% |
+| not on the GPU (CPU, launch gaps) | 0.206 | 0.103 | 0.159 | +0.056 | 6% |
+| sampling, copies, other kernels | 0.040 | 0.020 | 0.039 | +0.019 | 2% |
+| **decode step** | **6.292** | **3.146** | **4.079** | **+0.933** | |
+
+- **GEMM.** Each GPU reads half the weight bytes, but in 55% of the time, not
+  50%: the effective bandwidth of the GEMM kernels falls from 2.82 to 2.56 TB/s.
+- **Attention and norm** take the same time at both TP degrees. The residual
+  stream and its norms are replicated on every rank. At batch 1 the attention
+  kernels take as long for 16 heads as for 32 (at batch 32 they get 1.65× faster).
+- **Communication.** The fused all-reduce kernel also does the residual add and
+  RMSNorm that TP1 runs as separate kernels. That part (0.143 ms) is counted as
+  norm work; the rest of the kernel and the all-gather are the 0.231 ms.
+
+Batch 32 gives the same order (GEMM +0.355, communication +0.338, attention
++0.215, norm +0.168 of a 1.021 ms gap). There the traced runs differ from the
+untraced medians by −2.0% and +4.0%, so its "not on the GPU" row (−0.088 ms) is
+inside that mismatch ([SUMMARY](results/SUMMARY.md#why-tp2-is-not-2x)).
+
+**A-posteriori fit.** The model was refitted without using any TP2 engine run:
+effective bandwidth and fixed time per step from the eight TP1 decode points
+(2.69 TB/s, which is 80% of the HBM peak, and 0.69 ms; the a-priori values were
+3.0 TB/s and 0.8 ms), and α and β from the all-reduce microbenchmarks. TP1 is
+then fitted within 0.8%. TP2, predicted out of sample, is measured 0.08–0.29 ms
+slower than predicted at every batch (0.9–6.5%; 0.27 ms at batch 1).
+
+- The a-priori model hit H1 (1.555 predicted, 1.542 measured) with batch-1 step
+  times that were 6.9% (TP1) and 7.7% (TP2) too low; the errors cancelled in the
+  ratio. With TP1 calibrated, the same model predicts 1.657.
+- What a TP1-calibrated model lacks is in the table above: it halves the time of
+  everything that reads weights or KV, and GEMM and attention do not halve.
+- For pure NCCL (AR3) the microbenchmark does not transfer. M3 gives 12.5 µs
+  per all-reduce in graph mode; the engine's NCCL kernels take 6.8 µs in the
+  trace. The fit predicts AR3 0.68 ms above the baseline at batch 1, and the
+  measured difference is 0.36 ms.
+
+Tables: [SUMMARY](results/SUMMARY.md#a-posteriori-fit), `results/tidy/posteriori.csv`
+and `results/tidy/tp2_gap.csv`.
 
 **Read these numbers with:**
 
@@ -356,6 +416,7 @@ tpprof/                     the harness (python -m tpprof <subcommand>)
   procs.py, monitor.py      process groups and timeouts; GPU and CPU monitors
   logparse.py, promparse.py, results.py, stats.py, goodput.py   parsing, validity, statistics
   analyze.py, plots.py, report.py     tidy CSVs, figures, results/SUMMARY.md
+  posteriori.py, gap.py     the a-posteriori fit (TP1 only); TP2's gap to half of TP1 by kernel category
 scripts/                    runpod.py (RunPod REST), sync_to_box.sh, bootstrap_box.sh
 third_party/vllm_benchmarks/  vendored vLLM v0.30.0 benchmark scripts (Apache-2.0, see SOURCE.md)
 tests/                      unit, integration and contract tests; fixtures from the real 0.30.0 CLI

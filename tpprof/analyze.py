@@ -22,7 +22,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from tpprof import goodput, kernels, logparse, matrix, model, monitor, promparse, results, stats, traces
+from tpprof import (gap, goodput, kernels, logparse, matrix, model, monitor, posteriori, promparse, results, stats,
+                    traces)
 from tpprof.constants import (
     DECODE_BATCHES,
     DECODE_INPUT_LEN,
@@ -40,8 +41,9 @@ from tpprof.constants import (
 
 TABLES = ("offline_points", "online_runs", "saturation", "goodput", "s_star", "comm", "kv_capacity",
           "trace_summary", "trace_steps")
-# Also written to tidy/: the H2 bootstrap, the spec section 6 evidence table and the gap list.
-EXTRA_TABLES = ("efficiency_delta", "confounders", "gaps")
+# Also written to tidy/: the H2 bootstrap, the a-posteriori fit (spec 5.1), the split of TP2's gap to half of
+# TP1 by kernel category, the spec section 6 evidence table and the gap list.
+EXTRA_TABLES = ("efficiency_delta", "posteriori", "tp2_gap", "confounders", "gaps")
 ALL_TABLES = TABLES + EXTRA_TABLES
 VERDICTS = ("hit", "miss", "insufficient_data")
 
@@ -1413,6 +1415,8 @@ def analyze(results_dir: str) -> dict[str, list[dict]]:
         "efficiency_delta": efficiency_delta(lat),
         "confounders": _confounders(results_dir, effs, online_rows),
     }
+    tables["posteriori"] = posteriori.rows(tables, _fi_backend(effs))
+    tables["tp2_gap"] = gap.rows(tables)
     _status_gaps(runs, skipped, gaps)
     _expected_missing(runs, raw, effs, skipped, gaps)
     tables["gaps"] = gaps.rows

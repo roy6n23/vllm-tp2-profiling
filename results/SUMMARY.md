@@ -25,6 +25,7 @@ Bands come from `model.predictions()` (the committed `predictions.md`). Decision
 - TP2 prefill speedup over TP1 at 512 tokens: 1.21x
 - TP2 prefill speedup over TP1 at 8192 tokens: 1.6x
 - DP2 / TP2 saturation throughput: 1.107 (H3 hit)
+- TP2's batch-1 decode step is 0.933 ms above half of TP1's (4.079 vs 3.146 ms). By kernel category: GEMM (weights) +0.276, all-reduce and all-gather +0.231, attention +0.194, norm, residual, RoPE, activation +0.157, not on the GPU (CPU, launch gaps) +0.056, sampling, copies, other kernels +0.019 ms.
 
 ## Offline
 
@@ -261,6 +262,57 @@ alpha from sizes <= 64 KiB, beta from sizes >= 8 MiB (spec 4.6). M2 is the produ
 | comm_m4 | nccl_tests | out_of_place | eager | 26 | 14.56 | 310.7 |
 | comm_m4 | nccl_tests | out_of_place | graph | 26 | 4.884 | 324.7 |
 
+## A-posteriori fit
+
+The decode model of `predictions.md` with the constants that can be measured without a TP2 engine refitted (spec 5.1): `bw_eff` and `t_fixed` are the slope and intercept of the TP1 step time against the bytes a step reads; alpha and beta come from the all-reduce microbenchmarks; `t_extra_tp2` is set to 0. TP2 is then predicted out of sample, and residual = measured - a posteriori is what a TP1-calibrated model does not explain.
+
+| constant | a priori (central) | a posteriori | unit | source |
+|---|---|---|---|---|
+| bw_eff | 3 | 2.692 | TB/s | TP1 baseline decode, least squares over 8 batches (largest misfit 0.75%) |
+| t_fixed | 0.8 | 0.686 | ms | TP1 baseline decode, least squares over 8 batches (largest misfit 0.75%) |
+| t_extra_tp2 | 0.1 | 0 | ms | set to 0: no TP1 measurement can fit it, so it stays in the residual |
+| alpha | 5 | 4.571 | us | M2 flashinfer_mnnvl_fused_allreduce_rmsnorm_oneshot |
+| beta | 260 | 184.6 | GB/s | M2 flashinfer_mnnvl_fused_allreduce_rmsnorm_oneshot |
+| alpha_nccl_graph | 6 | 12.54 | us | M3 torch_nccl, graph, default variant |
+| beta_nccl | 260 | 311.9 | GB/s | M3 torch_nccl, graph, default variant |
+
+### Decode step (ms)
+
+| config | arm | batch | sample | measured | a priori | a posteriori | residual (ms) | residual |
+|---|---|---|---|---|---|---|---|---|
+| TP1 | base | 1 | in | 6.292 | 5.856 | 6.321 | -0.029 | -0.5% |
+| TP1 | base | 2 | in | 6.332 | 5.910 | 6.380 | -0.048 | -0.8% |
+| TP1 | base | 4 | in | 6.487 | 6.016 | 6.498 | -0.011 | -0.2% |
+| TP1 | base | 8 | in | 6.766 | 6.228 | 6.735 | +0.031 | +0.5% |
+| TP1 | base | 16 | in | 7.236 | 6.653 | 7.209 | +0.027 | +0.4% |
+| TP1 | base | 32 | in | 8.173 | 7.503 | 8.156 | +0.017 | +0.2% |
+| TP1 | base | 64 | in | 10.092 | 9.203 | 10.050 | +0.041 | +0.4% |
+| TP1 | base | 128 | in | 13.811 | 12.604 | 13.839 | -0.029 | -0.2% |
+| TP2 | base | 1 | out | 4.079 | 3.766 | 3.814 | +0.265 | +6.5% |
+| TP2 | base | 2 | out | 4.089 | 3.795 | 3.847 | +0.242 | +5.9% |
+| TP2 | base | 4 | out | 4.064 | 3.853 | 3.914 | +0.150 | +3.7% |
+| TP2 | base | 8 | out | 4.191 | 3.970 | 4.046 | +0.144 | +3.4% |
+| TP2 | base | 16 | out | 4.571 | 4.202 | 4.312 | +0.259 | +5.7% |
+| TP2 | base | 32 | out | 5.108 | 4.668 | 4.843 | +0.265 | +5.2% |
+| TP2 | base | 64 | out | 6.192 | 5.599 | 5.905 | +0.287 | +4.6% |
+| TP2 | base | 128 | out | 8.104 | 7.462 | 8.028 | +0.076 | +0.9% |
+| TP2 | AR3 | 1 | out | 4.435 | 3.993 | 4.493 | -0.059 | -1.3% |
+| TP2 | AR3 | 32 | out | 5.639 | 4.896 | 5.477 | +0.163 | +2.9% |
+| TP2 | AR3 | 128 | out | 8.869 | 7.690 | 8.522 | +0.347 | +3.9% |
+
+### TP2 decode speedup over TP1
+
+| batch | measured | a priori | a posteriori |
+|---|---|---|---|
+| 1 | 1.542 | 1.555 | 1.657 |
+| 2 | 1.548 | 1.557 | 1.658 |
+| 4 | 1.596 | 1.561 | 1.660 |
+| 8 | 1.615 | 1.569 | 1.664 |
+| 16 | 1.583 | 1.583 | 1.672 |
+| 32 | 1.600 | 1.607 | 1.684 |
+| 64 | 1.630 | 1.644 | 1.702 |
+| 128 | 1.704 | 1.689 | 1.724 |
+
 ## Traces
 
 Traced shares are fractions of the traced window; nsys step times are not headline latency (spec 4.5). idle_est = 1 - traced busy per step / untraced median step (AM16). A trace that fails the completeness gate is listed but decides no hypothesis (spec 4.5). TP2 comm = fused AR time - TP1's per-step fused_add_rms_norm time (AM16); AR1-AR3 are unfused, so their AR time is comm. Per-step rows are in `tidy/trace_steps.csv`.
@@ -279,6 +331,36 @@ Traced shares are fractions of the traced window; nsys step times are not headli
 | TP2 | AR3 | decode:b1 | ok | 256 | 65 / 1 | 0.0751 | 0.00278 | 0.406 / 0.0693 | 0.44 / n/a / 0.44 | P2-trace-TP2-AR3-r0-6a72aec8 |
 | TP1 | G1 | decode:b1 | ok | 256 | 0 / 0 | 0.285 | 0.00187 | n/a / n/a |  | P2-trace-TP1-G1-r0-075888da |
 | TP2 | G1 | decode:b1 | ok | 256 | 65 / 1 | 0.208 | 0.0029 | 0.336 / 9.55 | 0.44 / 0.142 / 0.298 | P2-trace-TP2-G1-r0-faa4b0ea |
+
+## Why TP2 is not 2x
+
+Per decode step, by kernel category: the mean over the pure decode steps of the baseline traces (TP2: also the mean of the two ranks). The step totals are the untraced medians, and "not on the GPU" is what the kernels leave of the step. Excess = TP2 - TP1 / 2; the excesses add up to the gap. The fused all-reduce kernel also does TP1's standalone residual add + RMSNorm; that time is counted as norm work, not as communication (AM16). The kernel times come from traced runs, whose step time differs from the untraced median by the ratio under each table; "not on the GPU" absorbs that difference. Rows are in `tidy/tp2_gap.csv`.
+
+### Batch 1: TP1 6.292 ms, half of it 3.146 ms, TP2 4.079 ms (gap 0.933 ms, speedup 1.54x)
+
+| component | TP1 (ms) | TP1 / 2 (ms) | TP2 (ms) | excess (ms) | share of gap |
+|---|---|---|---|---|---|
+| GEMM (weights) | 5.313 | 2.657 | 2.933 | +0.276 | +30% |
+| attention | 0.413 | 0.206 | 0.400 | +0.194 | +21% |
+| norm, residual, RoPE, activation | 0.319 | 0.160 | 0.317 | +0.157 | +17% |
+| all-reduce and all-gather | 0.000 | 0.000 | 0.231 | +0.231 | +25% |
+| sampling, copies, other kernels | 0.040 | 0.020 | 0.039 | +0.019 | +2% |
+| not on the GPU (CPU, launch gaps) | 0.206 | 0.103 | 0.159 | +0.056 | +6% |
+
+Traced / untraced step: TP1 1.006, TP2 1.018.
+
+### Batch 32: TP1 8.173 ms, half of it 4.086 ms, TP2 5.108 ms (gap 1.021 ms, speedup 1.60x)
+
+| component | TP1 (ms) | TP1 / 2 (ms) | TP2 (ms) | excess (ms) | share of gap |
+|---|---|---|---|---|---|
+| GEMM (weights) | 5.453 | 2.726 | 3.081 | +0.355 | +35% |
+| attention | 2.010 | 1.005 | 1.220 | +0.215 | +21% |
+| norm, residual, RoPE, activation | 0.364 | 0.182 | 0.350 | +0.168 | +16% |
+| all-reduce and all-gather | 0.000 | 0.000 | 0.338 | +0.338 | +33% |
+| sampling, copies, other kernels | 0.103 | 0.051 | 0.085 | +0.033 | +3% |
+| not on the GPU (CPU, launch gaps) | 0.243 | 0.122 | 0.033 | -0.088 | -9% |
+
+Traced / untraced step: TP1 0.980, TP2 1.040.
 
 ## KV capacity
 
@@ -353,6 +435,7 @@ Every engine boot's `GPU KV cache size` line. The first boot of each config runs
 - [trace_breakdown.png](figures/trace_breakdown.png)
 - [ar_ladder.png](figures/ar_ladder.png)
 - [graphs_ablation.png](figures/graphs_ablation.png)
+- [tp2_gap_waterfall.png](figures/tp2_gap_waterfall.png)
 
 ## Confounder evidence
 
