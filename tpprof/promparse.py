@@ -58,8 +58,8 @@ def metric_sum(samples, name: str) -> float:
 
 
 def scrape_summary(text: str, gauges: bool = True) -> dict[str, float]:
-    """TRACKED counters and (unless gauges=False, for a server that exposes none) GAUGES, each summed over
-    label sets -> {name: value}."""
+    """TRACKED counters and (unless gauges=False, for a server whose gauges are empty while idle) GAUGES,
+    each summed over label sets -> {name: value}."""
     names = (*TRACKED, *GAUGES) if gauges else TRACKED
     samples = parse_prometheus(text)
     present = {n for n, _, _ in samples}

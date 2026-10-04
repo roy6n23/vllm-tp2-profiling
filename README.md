@@ -147,8 +147,10 @@ and `results/tidy/tp2_gap.csv`.
   (~700 W draw); no thermal throttle reason appeared, max 68 °C.
 - **Excluded data.** Three sweep sub-runs at the top rate had 1–5 client-side
   connection errors out of thousands of requests and are marked invalid. The
-  two API2 sessions were rerun after a harness fix: vLLM 0.30.0 exposes no
-  `/metrics` gauges with `--api-server-count 2`.
+  two API2 sessions were rerun after a harness fix: with `--api-server-count 2`,
+  vLLM 0.30.0's `/metrics` gauges have no samples until the server has handled
+  traffic, which the harness's check of an idle server took for missing gauges
+  (corrected 2026-10-04, [WORKLOG](WORKLOG.md)).
 - **Hosts.** Two earlier boxes (RunPod AP-IN-1) advertised NVSwitch multicast
   but failed to bind it (CUDA error 401), so every TP2 engine died in NCCL
   init. The full preflight now runs a real two-GPU all-reduce

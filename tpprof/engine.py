@@ -122,8 +122,10 @@ class EngineConfig:
 
     @property
     def exposes_gauges(self) -> bool:
-        """vLLM 0.30.0 disables stats logging, and with it the /metrics gauges, when --api-server-count > 1
-        ("AsyncLLM created with api_server_count more than 1; disabling stats logging", 2026-10-02 box)."""
+        """Whether the /metrics gauges have samples while the server is idle. With --api-server-count > 1,
+        vLLM 0.30.0's gauges ("mostrecent" in prometheus_client's multiprocess mode) export no sample until the
+        engine has reported scheduler stats, so an idle server shows only their TYPE lines and the check before
+        traffic fails (WORKLOG 2026-10-02, corrected 2026-10-04). Such servers run on their counters."""
         return self.api_servers == 1
 
     def engine_args(self) -> list[str]:

@@ -140,6 +140,17 @@ result comes from the first two.
   `/metrics` gauges, so both API2 sessions failed in the gauge poller. Such
   servers now run on the counters alone (`no_gauges`); the two sessions were
   rerun.
+
+  **Correction (2026-10-04):** the gauges are there; they are empty while the
+  server is idle. In both API2 sessions `sub-0/metrics_before.prom` has only the
+  `# TYPE vllm:num_requests_running gauge` line, and `metrics_after.prom` has a
+  sample per engine. A single-API-server run has the sample while idle
+  (`P1-serve_session-TP2-base-r0-d52c5a40`). With several API servers vLLM keeps its
+  metrics in prometheus_client's multiprocess mode, where these gauges ("mostrecent")
+  export no sample until the engine has reported scheduler stats once. The
+  "disabling stats logging" line is real but is not why the gauges looked missing.
+  The `no_gauges` workaround still holds; only the reason above was wrong. Found
+  while preparing an upstream report.
 - The report paired the median of the round s\* values with the bootstrap CI of
   the pooled-request s\*, a different estimator (17.69 vs CI 18.82-19.03 around
   18.93). Both are now reported, each with its own label.

@@ -632,7 +632,7 @@ def _sub_row(run: Run, k: int, sub: str) -> tuple[dict, results.ServeResult, lis
              "arm": meta.get("arm", run.arm), "round": int(meta.get("round", run.round)),
              "rate_target": rate if rate is not None else r.request_rate}
     row = results.online_row(r, extra)
-    # the runner records no_gauges for a server that exposes none (two API servers)
+    # the runner records no_gauges for a server whose gauges are empty while idle (two API servers)
     deltas, metrics_note = _metric_deltas(sub, gauges="no_gauges" not in validation.get("flags", []))
     cpu, cpu_scope, cpu_note, errors = _cpu_for(sub, run.path, k)
     throttled, gpu_error = _throttled(sub, run.path)

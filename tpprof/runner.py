@@ -1121,7 +1121,7 @@ class Runner:
         with open(os.path.join(sub_dir, "metrics_before.prom"), "w") as f:
             f.write(before_text)
         # spec 4.4: the gauges are sampled once per second during saturation (rate inf) runs, when the
-        # server exposes them (not with two API servers, see EngineConfig.exposes_gauges)
+        # server has them while idle (not with two API servers, see EngineConfig.exposes_gauges)
         gauges = all(cfg.exposes_gauges for cfg in self._engine_configs(spec))
         poller = (server.MetricsPoller([h.base_url for h in handles], os.path.join(sub_dir, "gauges.csv"))
                   if math.isinf(sub.rate) and gauges else contextlib.nullcontext())
